@@ -1,0 +1,34 @@
+{
+  "name": "katie",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/orcachillin/katie.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/orcachillin/katie/issues"
+  },
+  "homepage": "https://github.com/orcachillin/katie#readme",
+  "dependencies": {
+    "@openrouter/agent": "^0.7.1",
+    "@openrouter/sdk": "^0.12.79",
+    "cheerio": "^1.2.0",
+    "debug": "^4.4.3",
+    "discord.js": "^14.26.4",
+    "discord.js-selfbot-v13": "^3.7.1",
+    "dotenv": "^17.4.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
