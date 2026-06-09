@@ -4,11 +4,11 @@ import z from "zod"
 import { stateManager } from "../StateManager.js"
 import { openRouter } from "../deps.js"
 
-/** estimate how many chars the context is using */
-function estimateContextSize(messages: unknown[]): number {
+/** estimate how many words the context is using (closer to token count) */
+function estimateContextWords(messages: unknown[]): number {
     let total = 0
     for (const m of messages) {
-        total += JSON.stringify(m).length
+        total += JSON.stringify(m).split(/\s+/).length
     }
     return total
 }
@@ -42,8 +42,8 @@ function formatMessages(messages: unknown[]): string {
         .join("\n")
 }
 
-// threshold in chars — ~80% of ~25k typical context for a small model
-const COMPACT_THRESHOLD = 20000
+// threshold in words — ~80% of ~60k words for a 1M-token model
+const COMPACT_THRESHOLD = 50000
 
 export const compact = tool({
     name: "compact",
@@ -67,11 +67,11 @@ export const compact = tool({
             return "no messages to compact"
         }
 
-        const size = estimateContextSize(messages)
+        const words = estimateContextWords(messages)
 
-        if (size < COMPACT_THRESHOLD) {
+        if (words < COMPACT_THRESHOLD) {
             return (
-                `context is ${size} chars (under ${COMPACT_THRESHOLD} threshold), ` +
+                `context is ${words} words (under ${COMPACT_THRESHOLD} threshold), ` +
                 `no compaction needed yet`
             )
         }
@@ -79,7 +79,7 @@ export const compact = tool({
         const formatted = formatMessages(messages)
 
         console.log(
-            `compacting ${messages.length} messages (${size} chars) for channel ${channelId}`,
+            `compacting ${messages.length} messages (${words} words) for channel ${channelId}`,
         )
 
         const result = openRouter.callModel({
@@ -88,7 +88,7 @@ export const compact = tool({
                 "you are a conversation condensor. distill the conversation below into " +
                 "a tight summary. preserve: who the people are, key facts shared, decisions " +
                 "made, inside jokes, ongoing tasks, emotional beats. " +
-                "respond with ONLY the summary, under 600 characters.",
+                "respond with ONLY the summary, under 600 words.",
             input: [{ role: "user" as const, content: formatted }],
         })
 
@@ -111,9 +111,8 @@ export const compact = tool({
         stateManager.set(channelId, state)
 
         return (
-            `compacted ${messages.length} messages (${size} chars → ` +
-            `${estimateContextSize(compacted)} chars). ` +
-            `summary: ${cleaned.slice(0, 200)}`
+            `compacted ${messages.length} messages (${words} words → ` +
+            `${estimateContextWords(compacted)} words). `
         )
     },
 })

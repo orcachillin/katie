@@ -43,16 +43,16 @@ function formatMessages(messages: unknown[]): string {
         .join("\n")
 }
 
-/** estimate how many chars the context is using */
-function estimateContextSize(messages: unknown[]): number {
+/** estimate how many words the context is using (closer to token count) */
+function estimateContextWords(messages: unknown[]): number {
     let total = 0
     for (const m of messages) {
-        total += JSON.stringify(m).length
+        total += JSON.stringify(m).split(/\s+/).length
     }
     return total
 }
 
-const COMPACT_THRESHOLD = 20000
+const COMPACT_THRESHOLD = 50000
 
 class Agent {
     private model = "minimax/minimax-m3"
@@ -65,11 +65,11 @@ class Agent {
         const messages = normalizeInputToArray(state.messages)
         if (messages.length === 0) return
 
-        const size = estimateContextSize(messages)
+        const size = estimateContextWords(messages)
         if (size < COMPACT_THRESHOLD) return
 
         console.log(
-            `auto-compacting ${messages.length} messages (${size} chars) for channel ${channelId}`,
+            `auto-compacting ${messages.length} messages (${size} words) for channel ${channelId}`,
         )
 
         const formatted = formatMessages(messages)
@@ -101,7 +101,7 @@ class Agent {
         state.messages = compacted
         stateManager.set(channelId, state)
 
-        console.log(`compacted to ${estimateContextSize(compacted)} chars`)
+        console.log(`compacted to ${estimateContextWords(compacted)} words`)
     }
 
     async handleMessage(message: Message, extra?: string) {
