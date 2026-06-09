@@ -10,6 +10,8 @@ export const sendFriendRequest = tool({
     }),
     outputSchema: z.any(),
     execute: async (params: Record<string, unknown>) => {
+        console.log('friendrequest', params)
+
         const user = await client.users.fetch(params.userId as string)
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const api = client.api as any

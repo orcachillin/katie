@@ -11,6 +11,7 @@ export const keysmash = tool({
         response: z.string()
     }),
     execute: async (params: Record<string, unknown>) => {
+        console.log('keysmash', params)
         const chars = "asdfghjklzxnmbuyw"
 
         let response = ''

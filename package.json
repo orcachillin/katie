@@ -26,6 +26,7 @@
     "discord.js": "^14.26.4",
     "discord.js-selfbot-v13": "^3.7.1",
     "dotenv": "^17.4.2",
+    "pm2": "^7.0.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

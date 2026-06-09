@@ -16,6 +16,7 @@ export const webSearch = tool({
         }),
     ),
     execute: async (params: Record<string, unknown>) => {
+        console.log('websearch', params)
         const query = encodeURIComponent(params.query as string)
         const res = await fetch(`https://html.duckduckgo.com/html/?q=${query}`)
         const html = await res.text()
