@@ -5,6 +5,7 @@ import { contextManager } from "./ContextManager.js"
 import { channelManager } from "./ChannelManager.js"
 import { toolLoader } from "./ToolLoader.js"
 import { promptManager } from "./PromptManager.js"
+import { createInitialState, normalizeInputToArray } from "@openrouter/agent"
 
 interface Response {
     content: string
@@ -13,8 +14,95 @@ interface Response {
     interruptQueue: boolean
 }
 
+/** flatten message content to plain text */
+function flattenContent(content: unknown): string {
+    if (typeof content === "string") return content
+    if (Array.isArray(content)) {
+        return content
+            .map((block: Record<string, unknown>) => {
+                if (block.type === "output_text" || block.type === "input_text") {
+                    return (block.text as string) ?? ""
+                }
+                return JSON.stringify(block)
+            })
+            .join(" ")
+    }
+    return JSON.stringify(content)
+}
+
+/** format full message history for the summarizer */
+function formatMessages(messages: unknown[]): string {
+    return messages
+        .map((m) => {
+            if (typeof m !== "object" || m === null) return JSON.stringify(m)
+            const msg = m as Record<string, unknown>
+            const role = (msg.role as string) ?? "unknown"
+            const content = flattenContent(msg.content)
+            return `${role}: ${content}`
+        })
+        .join("\n")
+}
+
+/** estimate how many chars the context is using */
+function estimateContextSize(messages: unknown[]): number {
+    let total = 0
+    for (const m of messages) {
+        total += JSON.stringify(m).length
+    }
+    return total
+}
+
+const COMPACT_THRESHOLD = 20000
+
 class Agent {
     private model = "minimax/minimax-m3"
+
+    /** check if the state needs compaction and compact it if so */
+    private async maybeCompact(channelId: string) {
+        const state = stateManager.get(channelId)
+        if (!state) return
+
+        const messages = normalizeInputToArray(state.messages)
+        if (messages.length === 0) return
+
+        const size = estimateContextSize(messages)
+        if (size < COMPACT_THRESHOLD) return
+
+        console.log(
+            `auto-compacting ${messages.length} messages (${size} chars) for channel ${channelId}`,
+        )
+
+        const formatted = formatMessages(messages)
+
+        const result = openRouter.callModel({
+            model: this.model,
+            instructions:
+                "you are a conversation condensor. distill the conversation below into " +
+                "a tight summary. preserve: who the people are, key facts shared, decisions " +
+                "made, inside jokes, ongoing tasks, emotional beats. " +
+                "respond with ONLY the summary, under 600 characters.",
+            input: [{ role: "user" as const, content: formatted }],
+        })
+
+        const summary = await result.getText()
+        const cleaned = summary.replaceAll(/```(\w+)?/g, "").trim()
+
+        const keepCount = Math.min(2, messages.length)
+        const recent = messages.slice(-keepCount)
+
+        const compacted = [
+            {
+                role: "system" as const,
+                content: `[compacted conversation summary]: ${cleaned}`,
+            },
+            ...recent,
+        ]
+
+        state.messages = compacted
+        stateManager.set(channelId, state)
+
+        console.log(`compacted to ${estimateContextSize(compacted)} chars`)
+    }
 
     async handleMessage(message: Message, extra?: string) {
         const ctx = contextManager.get(message.channelId)
@@ -36,6 +124,8 @@ class Agent {
             `embeds: [${message.embeds.map((a) => JSON.stringify(a.toJSON())).join(",")}]`,
             `queuedMessageCount: ${ctx.timeouts.length / 2}`,
         ].join("\n")
+
+        await this.maybeCompact(message.channelId)
 
         const result = openRouter.callModel({
             model: this.model,

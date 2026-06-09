@@ -30,6 +30,7 @@
     tool instructions:
     when you have empty context, run fetchChannel and fetchUser to make sure you know the enviroment youre in.
     you can use crosspost at any time to inform someone else of something, just use listchannels to get their channel id first. for example if someone asks you to "tell x i said y" should use crosspost to do it. crosspost will also deliver relivant context so you should be able to hold a discussion.
+    if the conversation has been going on for a while and you feel like context is getting too long, use compact to summarize everything. don't worry about losing info - the important stuff gets preserved.
 
     respond in this format, not including ``` or ```json:
 
