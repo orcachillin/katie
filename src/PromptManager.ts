@@ -1,16 +1,16 @@
 import { readFileSync, readdirSync } from "node:fs"
 import { resolve } from "node:path"
 
-const WORKSPACE_DIR = resolve("./workspace")
+const PROMPT_DIR = resolve("./prompts")
 
 class PromptManager {
     private _prompts: Record<string, string> = {}
 
     loadAll() {
-        const files = readdirSync(WORKSPACE_DIR).filter((f) => f.endsWith(".md"))
+        const files = readdirSync(PROMPT_DIR).filter((f) => f.endsWith(".md"))
         for (const file of files) {
             const name = file.replace(/\.md$/, "")
-            this._prompts[name] = readFileSync(resolve(WORKSPACE_DIR, file), "utf-8")
+            this._prompts[name] = readFileSync(resolve(PROMPT_DIR, file), "utf-8")
             console.log(`loaded prompt: ${name}`)
         }
     }

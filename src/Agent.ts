@@ -76,11 +76,7 @@ class Agent {
 
         const result = openRouter.callModel({
             model: this.model,
-            instructions:
-                "you are a conversation condensor. distill the conversation below into " +
-                "a tight summary. preserve: who the people are, key facts shared, decisions " +
-                "made, inside jokes, ongoing tasks, emotional beats. " +
-                "respond with ONLY the summary, under 600 characters.",
+            instructions: promptManager.get("condense"),
             input: [{ role: "user" as const, content: formatted }],
         })
 
@@ -110,20 +106,23 @@ class Agent {
 
         const instructions = promptManager.get("katie") ?? ""
 
+
         const content = [
             extra || "",
-            `currentTime: ${new Date().toDateString()} ${new Date().toTimeString()}`,
+            `time: ${new Date().toDateString()} ${new Date().toTimeString()}`,
             `timestamp: ${Date.now()}`,
-            `currentTimeMs: ${Date.now()}`,
             `messageId: ${message.id}`,
             `channelId: ${message.channel.id}`,
             `channelType: ${message.channel.type}`,
             `fromId: ${message.author.id}`,
             `from: ${message.author.displayName}`,
+            message.type == "REPLY" && `replyTo: ${message.reference?.messageId}`,
             `content: "${message.content}"`,
             `embeds: [${message.embeds.map((a) => JSON.stringify(a.toJSON())).join(",")}]`,
-            `queuedMessageCount: ${ctx.timeouts.length / 2}`,
+            `queuedMessages: \n${ctx.messageQueue.map(msg => `   in ${msg.sendAt - Date.now()}ms: ${msg.content}`).join("\n")}`,
         ].join("\n")
+
+        console.log(content)
 
         await this.maybeCompact(message.channelId)
 
@@ -149,27 +148,41 @@ class Agent {
                 if (response.interruptQueue) {
                     ctx.timeouts.forEach((t) => clearTimeout(t))
                     ctx.timeouts = []
+                    ctx.messageQueue = []
+
+                    console.log(`QUEUE INTERRUPT`)
                 }
 
                 const delayTime = response.sendAt - Date.now()
-                const startTypingDelay = delayTime - Math.round(Math.random() * 10000)
+                const startTypingDelay = delayTime - Math.round(Math.random() * 750) * response.content.split(" ").length
+
+                const queuedAt = Date.now()
+
+                ctx.messageQueue.push({
+                    ...response,
+                    queuedAt: queuedAt
+                })
 
                 console.log(`waiting ${(delayTime / 1000).toFixed(1)} seconds...`)
 
                 ctx.timeouts.push(setTimeout(async () => {
-                    await message.channel.sendTyping().catch(() => {})
+                    await message.channel.sendTyping().catch(() => { })
                 }, startTypingDelay))
 
                 ctx.timeouts.push(setTimeout(async () => {
+
+                    const indexToRemove = ctx.messageQueue.findIndex((m) => m.queuedAt == queuedAt)
+                    ctx.messageQueue.splice(indexToRemove, 1)
+
                     if (response.replyTo) {
                         try {
                             const replyMessage = await message.channel.messages.fetch(response.replyTo)
-                            await replyMessage.reply({ content: response.content }).catch(() => {})
+                            await replyMessage.reply({ content: response.content }).catch(() => { })
                         } catch {
-                            await message.channel.send({ content: response.content }).catch(() => {})
+                            await message.channel.send({ content: response.content }).catch(() => { })
                         }
                     } else {
-                        await message.channel.send({ content: response.content }).catch(() => {})
+                        await message.channel.send({ content: response.content }).catch(() => { })
                     }
                 }, delayTime))
             }

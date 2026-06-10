@@ -19,6 +19,7 @@ class Bot {
 
         client.on("messageCreate", async (message) => {
             if (message.author.id === client.user!.id) return
+            if (message.author.bot) return
             channelManager.add(message.channelId, message.channel as TextChannel)
             await agent.handleMessage(message)
         })

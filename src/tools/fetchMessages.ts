@@ -10,6 +10,7 @@ export const fetchMessages = tool({
         channelId: z.string().describe("channel id, just the digits"),
         before: z.string().optional().describe("message id to get messages before"),
         after: z.string().optional().describe("message id to get messages after"),
+        around: z.string().optional().describe("message id to get messages around"),
         limit: z.number().int().optional().describe("number of messages to fetch"),
     }),
     outputSchema: z.array(
@@ -28,6 +29,7 @@ export const fetchMessages = tool({
         ).messages.fetch({
             before: params.before as string | undefined,
             after: params.after as string | undefined,
+            around: params.around as string | undefined,
             limit: params.limit as number | undefined,
         })
 
