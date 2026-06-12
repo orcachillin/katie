@@ -55,12 +55,12 @@ class MemoryManager {
                 userInfo = readFileSync(userFilePath, "utf-8")
             } catch { }
 
-            peopleContext.push(userInfo || "no information on this user yet")
+            peopleContext.push(userInfo ?? "no information on this user yet")
         }
 
         const res: string[] = [channelContext, ...peopleContext]
 
-        return res.join("\n\n---\n\n")
+        return res.join("n\n")
     }
 
     writeMemoryFile(type: MemoryType.Channel | MemoryType.User, id: string, name: string, content: string): void

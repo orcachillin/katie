@@ -2,10 +2,10 @@ import { Message, TextChannel } from "discord.js-selfbot-v13"
 import { openRouter } from "./deps.js"
 import { stateManager } from "./StateManager.js"
 import { contextManager } from "./ContextManager.js"
-import { channelManager } from "./ChannelManager.js"
 import { toolLoader } from "./ToolLoader.js"
 import { promptManager } from "./PromptManager.js"
-import { createInitialState, normalizeInputToArray } from "@openrouter/agent"
+import { normalizeInputToArray } from "@openrouter/agent"
+import { imageManager } from "./ImageManager.js"
 
 interface Response {
     content: string
@@ -107,8 +107,9 @@ class Agent {
         const instructions = promptManager.get("katie") ?? ""
 
 
-        const content = [
+        const text_input = [
             extra || "",
+            '<metadata>',
             `time: ${new Date().toDateString()} ${new Date().toTimeString()}`,
             `timestamp: ${Date.now()}`,
             `messageId: ${message.id}`,
@@ -116,21 +117,26 @@ class Agent {
             `channelType: ${message.channel.type}`,
             `fromId: ${message.author.id}`,
             `from: ${message.author.displayName}`,
-            message.type == "REPLY" && `replyTo: ${message.reference?.messageId}`,
-            `content: "${message.content}"`,
+            message.type == "REPLY" ? `replyTo: ${message.reference?.messageId}` : "",
             `embeds: [${message.embeds.map((a) => JSON.stringify(a.toJSON())).join(",")}]`,
             `queuedMessages: \n${ctx.messageQueue.map(msg => `   in ${msg.sendAt - Date.now()}ms: ${msg.content}`).join("\n")}`,
+            '</metadata>',
+            `<content>${message.content}</content>`
         ].join("\n")
 
-        console.log(content)
-
         await this.maybeCompact(message.channelId)
+
+        // describe any images using a vision model and inject as text
+        const imageDescription = await imageManager.describeImages(message)
 
         const result = openRouter.callModel({
             model: this.model,
             instructions,
             state,
-            input: [{ role: "user" as const, content }],
+            input: [{
+                role: 'user' as const,
+                content: text_input + imageDescription,
+            }],
             tools: toolLoader.tools as never[],
         })
 

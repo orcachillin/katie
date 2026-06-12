@@ -15,8 +15,8 @@ class StateManager {
     initial(key: string) {
         const state = createInitialState(key)
 
-        appendToMessages(state.messages, [{
-            role: "stystem" as const,
+        state.messages = appendToMessages(state.messages, [{
+            role: "assistant" as const,
             content: memoryManager.getChannelContext(key)
         }])
 
