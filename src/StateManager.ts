@@ -1,6 +1,11 @@
 import { appendToMessages, createInitialState } from "@openrouter/agent"
 import type { StateAccessor, ConversationState } from "@openrouter/agent"
+import { TextChannel } from "discord.js-selfbot-v13"
+import { client } from "./deps.js"
 import { memoryManager } from "./MemoryManager.js"
+import { scheduledMessageManager } from "./ScheduledMessageManager.js"
+
+const RECENT_MESSAGE_LIMIT = 15
 
 class StateManager {
     private _states = new Map<string, ConversationState>()
@@ -12,12 +17,38 @@ class StateManager {
         }
     }
 
-    initial(key: string) {
+    async initial(key: string) {
         const state = createInitialState(key)
+
+        let context = memoryManager.getChannelContext(key)
+
+        // fetch recent discord messages for context
+        try {
+            const channel = await client.channels.fetch(key) as TextChannel
+            if (channel?.isText()) {
+                const messages = await channel.messages.fetch({ limit: RECENT_MESSAGE_LIMIT })
+                const formatted = messages.reverse().map(m =>
+                    `[${m.author.displayName}]: ${m.content}`
+                ).join("\n")
+                if (formatted) {
+                    context += `\n\nrecent messages in this channel:\n${formatted}`
+                }
+            }
+        } catch {
+            console.log(`couldn't fetch recent messages for channel ${key}`)
+        }
+
+        const channelSchedules = scheduledMessageManager.all.filter(m => m.channelId === key)
+        if (channelSchedules.length > 0) {
+            const scheduleSummary = channelSchedules.map(m =>
+                `  - [${m.id}] at ${new Date(m.sendAt).toISOString()}: "${m.content.slice(0, 100)}"`
+            ).join("\n")
+            context += `\n\npending scheduled messages for this channel:\n${scheduleSummary}`
+        }
 
         state.messages = appendToMessages(state.messages, [{
             role: "assistant" as const,
-            content: memoryManager.getChannelContext(key)
+            content: context,
         }])
 
         return state

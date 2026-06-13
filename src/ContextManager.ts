@@ -1,6 +1,7 @@
 export interface Context {
     messageQueue: QueuedMessage[]
     timeouts: NodeJS.Timeout[]
+    recentMessageIds: string[]
 }
 
 export interface QueuedMessage {
@@ -10,17 +11,20 @@ export interface QueuedMessage {
     replyTo: string
 }
 
+const MAX_RECENT = 10
+
 class ContextManager {
     private _contexts: Record<string, Context> = {}
 
     private readonly default: Context = {
         messageQueue: [],
-        timeouts: []
+        timeouts: [],
+        recentMessageIds: [],
     }
 
     get(channelId: string): Context {
         if (!this._contexts[channelId]) {
-            this._contexts[channelId] = { ...this.default }
+            this._contexts[channelId] = { ...this.default, recentMessageIds: [] }
         }
         return this._contexts[channelId]
     }
@@ -41,6 +45,18 @@ class ContextManager {
     addMessageToQueue(channelId: string, message: QueuedMessage) {
         const ctx = this.get(channelId)
         ctx.messageQueue.push(message)
+    }
+
+    trackSentMessage(channelId: string, messageId: string) {
+        const ctx = this.get(channelId)
+        ctx.recentMessageIds.push(messageId)
+        if (ctx.recentMessageIds.length > MAX_RECENT) {
+            ctx.recentMessageIds.shift()
+        }
+    }
+
+    getRecentMessageIds(channelId: string): string[] {
+        return this.get(channelId).recentMessageIds
     }
 }
 

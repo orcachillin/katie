@@ -9,7 +9,6 @@ export const listChannels = tool({
     inputSchema: z.object({}),
     outputSchema: z.any(),
     execute: async () => {
-        console.log(`fetchchannels`)
         return channelManager.channels
     },
 })

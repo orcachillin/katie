@@ -22,8 +22,6 @@ export const fetchMessages = tool({
         }),
     ),
     execute: async (params: Record<string, unknown>) => {
-        console.log(`fetchmessages`, params)
-
         const messages = await (
             client.channels.cache.get(params.channelId as string) as TextChannel
         ).messages.fetch({

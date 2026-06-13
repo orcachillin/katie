@@ -35,7 +35,25 @@ class ToolLoader {
                         "type" in (val as object) &&
                         "function" in (val as object)
                     ) {
-                        this._tools.push(val as ToolShape)
+                        const tool = val as ToolShape
+                        const origExecute = tool.function.execute as
+                            ((params: Record<string, unknown>) => Promise<unknown>) | undefined
+                        if (origExecute) {
+                            const name = (tool.function.name as string) ?? key
+                            tool.function.execute = async (params: Record<string, unknown>) => {
+                                const start = Date.now()
+                                console.log(`tool call: ${name}`, params)
+                                try {
+                                    const result = await origExecute(params)
+                                    console.log(`tool done: ${name} (${Date.now() - start}ms)`)
+                                    return result
+                                } catch (err) {
+                                    console.log(`tool error: ${name} (${Date.now() - start}ms): ${err}`)
+                                    throw err
+                                }
+                            }
+                        }
+                        this._tools.push(tool)
                         console.log(`loaded tool: ${key}`)
                     }
                 }
@@ -45,6 +63,12 @@ class ToolLoader {
         }
 
         console.log(`loaded ${this._tools.length} tools total`)
+    }
+
+    async reload() {
+        this._tools = []
+        console.log("reloading tools...")
+        await this.loadAll()
     }
 }
 

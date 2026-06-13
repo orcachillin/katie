@@ -6,6 +6,7 @@ import { toolLoader } from "./ToolLoader.js"
 import { promptManager } from "./PromptManager.js"
 import { normalizeInputToArray } from "@openrouter/agent"
 import { imageManager } from "./ImageManager.js"
+import { typoify } from "./util/typo.js"
 
 interface Response {
     content: string
@@ -100,7 +101,7 @@ class Agent {
         console.log(`compacted to ${estimateContextWords(compacted)} words`)
     }
 
-    async handleMessage(message: Message, extra?: string) {
+    async handleMessage(message: Message, extra?: string, signal?: AbortSignal) {
         const ctx = contextManager.get(message.channelId)
         const state = stateManager.getStateAccessor(message.channelId)
 
@@ -120,6 +121,7 @@ class Agent {
             message.type == "REPLY" ? `replyTo: ${message.reference?.messageId}` : "",
             `embeds: [${message.embeds.map((a) => JSON.stringify(a.toJSON())).join(",")}]`,
             `queuedMessages: \n${ctx.messageQueue.map(msg => `   in ${msg.sendAt - Date.now()}ms: ${msg.content}`).join("\n")}`,
+            `recentMessageIds: [${ctx.recentMessageIds.join(", ")}]`,
             '</metadata>',
             `<content>${message.content}</content>`
         ].join("\n")
@@ -129,18 +131,24 @@ class Agent {
         // describe any images using a vision model and inject as text
         const imageDescription = await imageManager.describeImages(message)
 
-        const result = openRouter.callModel({
-            model: this.model,
-            instructions,
-            state,
-            input: [{
-                role: 'user' as const,
-                content: text_input + imageDescription,
-            }],
-            tools: toolLoader.tools as never[],
-        })
+        let text: string
+        try {
+            const result = openRouter.callModel({
+                model: this.model,
+                instructions,
+                state,
+                input: [{
+                    role: 'user' as const,
+                    content: text_input + imageDescription,
+                }],
+                tools: toolLoader.tools as never[],
+            }, { signal })
 
-        const text = await result.getText()
+            text = await result.getText()
+        } catch (err) {
+            if ((err as Error)?.name === "AbortError") return
+            throw err
+        }
 
         try {
             const responses = JSON.parse(
@@ -180,15 +188,31 @@ class Agent {
                     const indexToRemove = ctx.messageQueue.findIndex((m) => m.queuedAt == queuedAt)
                     ctx.messageQueue.splice(indexToRemove, 1)
 
+                    const typoContent = Math.random() < 0.15 ? typoify(response.content) : null
+                    const sendContent = typoContent ?? response.content
+
+                    let sent: Message | undefined
                     if (response.replyTo) {
                         try {
                             const replyMessage = await message.channel.messages.fetch(response.replyTo)
-                            await replyMessage.reply({ content: response.content }).catch(() => { })
+                            sent = await replyMessage.reply({ content: sendContent }).catch(() => undefined)
                         } catch {
-                            await message.channel.send({ content: response.content }).catch(() => { })
+                            sent = await message.channel.send({ content: sendContent }).catch(() => undefined)
                         }
                     } else {
-                        await message.channel.send({ content: response.content }).catch(() => { })
+                        sent = await message.channel.send({ content: sendContent }).catch(() => undefined)
+                    }
+                    if (sent) {
+                        contextManager.trackSentMessage(message.channelId, sent.id)
+                        if (typoContent) {
+                            const editDelay = 3000 + Math.random() * 5000
+                            console.log(`typo in ${sent.id}, fixing in ${(editDelay / 1000).toFixed(1)}s`)
+                            ctx.timeouts.push(setTimeout(async () => {
+                                try {
+                                    await sent.edit({ content: response.content })
+                                } catch { }
+                            }, editDelay))
+                        }
                     }
                 }, delayTime))
             }
@@ -196,6 +220,7 @@ class Agent {
             await this.handleMessage(
                 message,
                 `you tried to send "${text}" but it wasnt properly formatted json. try again please!\n`,
+                signal
             )
         }
     }

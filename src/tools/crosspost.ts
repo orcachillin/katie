@@ -39,8 +39,6 @@ export const crosspost = tool({
     }),
     outputSchema: z.any(),
     execute: async (params: Record<string, unknown>) => {
-        console.log(`crosspost`, params)
-
         const channel = channelManager.get(params.channelId as string)
 
         if (!channel) {

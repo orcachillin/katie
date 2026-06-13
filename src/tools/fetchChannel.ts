@@ -12,8 +12,6 @@ export const fetchChannel = tool({
     }),
     outputSchema: z.any(),
     execute: async (params: Record<string, unknown>) => {
-        console.log(`fetchchannel`, params)
-
         const channel = await client.channels.fetch(params.channelId as string)
 
         if (channel && channel.isText()) {
