@@ -8,7 +8,7 @@ export interface QueuedMessage {
     queuedAt: number // NOT MESSAGE ID, ITS AN IDENTIFIER TO REMOVE IT
     sendAt: number,
     content: string,
-    replyTo: string
+    replyTo?: string
 }
 
 const MAX_RECENT = 10

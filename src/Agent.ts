@@ -8,11 +8,43 @@ import { normalizeInputToArray } from "@openrouter/agent"
 import { imageManager } from "./ImageManager.js"
 import { typoify } from "./util/typo.js"
 
-interface Response {
-    content: string
-    replyTo: string
-    sendAt: number
-    interruptQueue: boolean
+interface MessageOptions {
+    delayTime?: number
+    replyTo?: string
+    react?: { emoji: string; messageId: string }[]
+}
+
+type OptionHandler = (val: string, opts: MessageOptions) => void
+
+const optionHandlers: Record<string, OptionHandler> = {
+    delayTime: (val, opts) => { opts.delayTime = Number(val) },
+    replyTo: (val, opts) => { opts.replyTo = val },
+    react: (val, opts) => {
+        opts.react = val.split(";").map(pair => {
+            const lastColon = pair.lastIndexOf(":")
+            return {
+                emoji: pair.slice(0, lastColon),
+                messageId: pair.slice(lastColon + 1),
+            }
+        })
+    },
+}
+
+/** parse leading header like [delayTime=3000,replyTo=id] from message content */
+function parseHeader(raw: string): { text: string; opts: MessageOptions } {
+    const opts: MessageOptions = {}
+    const headerMatch = raw.match(/\[([^\]]+)\](.*)/s)
+    if (!headerMatch) return { text: raw, opts }
+
+    for (const pair of headerMatch[1].split(",")) {
+        const eqIdx = pair.indexOf("=")
+        if (eqIdx === -1) continue
+        const key = pair.slice(0, eqIdx).trim()
+        const val = pair.slice(eqIdx + 1).trim()
+        optionHandlers[key]?.(val, opts)
+    }
+
+    return { text: headerMatch[2].trim(), opts }
 }
 
 /** flatten message content to plain text */
@@ -53,7 +85,7 @@ function estimateContextWords(messages: unknown[]): number {
     return total
 }
 
-const COMPACT_THRESHOLD = 50000
+const COMPACT_THRESHOLD = 15000
 
 class Agent {
     private model = "minimax/minimax-m3"
@@ -114,14 +146,9 @@ class Agent {
             `time: ${new Date().toDateString()} ${new Date().toTimeString()}`,
             `timestamp: ${Date.now()}`,
             `messageId: ${message.id}`,
-            `channelId: ${message.channel.id}`,
-            `channelType: ${message.channel.type}`,
-            `fromId: ${message.author.id}`,
-            `from: ${message.author.displayName}`,
+            `from: ${message.author.id}`,
             message.type == "REPLY" ? `replyTo: ${message.reference?.messageId}` : "",
-            `embeds: [${message.embeds.map((a) => JSON.stringify(a.toJSON())).join(",")}]`,
             `queuedMessages: \n${ctx.messageQueue.map(msg => `   in ${msg.sendAt - Date.now()}ms: ${msg.content}`).join("\n")}`,
-            `recentMessageIds: [${ctx.recentMessageIds.join(", ")}]`,
             '</metadata>',
             `<content>${message.content}</content>`
         ].join("\n")
@@ -137,6 +164,12 @@ class Agent {
                 model: this.model,
                 instructions,
                 state,
+                provider: {
+                    sort: "price",
+                    allowFallbacks: true,
+                    // only: ["minimax"],
+                    ignore: ["morph"]
+                },
                 input: [{
                     role: 'user' as const,
                     content: text_input + imageDescription,
@@ -150,79 +183,101 @@ class Agent {
             throw err
         }
 
-        try {
-            const responses = JSON.parse(
-                text.replaceAll(/```(json)?/g, ""),
-            ) as Response[]
-            if (!responses) return
+        const rawMessages = text.split("\n\n")
+        let currentDelay = 0
 
-            for (const response of responses) {
-                if (response.content.length === 0) return
+        for (const raw of rawMessages) {
+            if (raw.length === 0) return
 
-                if (response.interruptQueue) {
-                    ctx.timeouts.forEach((t) => clearTimeout(t))
-                    ctx.timeouts = []
-                    ctx.messageQueue = []
+            const { text: content, opts } = parseHeader(raw)
 
-                    console.log(`QUEUE INTERRUPT`)
-                }
+            const messageDelay = opts.delayTime ?? content.split(" ").length * 400
+            const delayTime = currentDelay + messageDelay
+            currentDelay += messageDelay
 
-                const delayTime = response.sendAt - Date.now()
-                const startTypingDelay = delayTime - Math.round(Math.random() * 750) * response.content.split(" ").length
+            const startTypingDelay = delayTime * 0.1
+            const queuedAt = Date.now()
+            const sendAt = queuedAt + delayTime
 
-                const queuedAt = Date.now()
+            ctx.messageQueue.push({
+                ...{
+                    content,
+                    queuedAt,
+                    sendAt,
+                },
+                queuedAt: queuedAt
+            })
 
-                ctx.messageQueue.push({
-                    ...response,
-                    queuedAt: queuedAt
-                })
+            console.log(`waiting ${(delayTime / 1000).toFixed(1)} seconds...`)
 
-                console.log(`waiting ${(delayTime / 1000).toFixed(1)} seconds...`)
+            content && ctx.timeouts.push(setTimeout(async () => {
+                await message.channel.sendTyping().catch(() => { })
+            }, startTypingDelay))
 
-                ctx.timeouts.push(setTimeout(async () => {
-                    await message.channel.sendTyping().catch(() => { })
-                }, startTypingDelay))
+            ctx.timeouts.push(setTimeout(async () => {
 
-                ctx.timeouts.push(setTimeout(async () => {
+                const indexToRemove = ctx.messageQueue.findIndex((m) => m.queuedAt == queuedAt)
+                ctx.messageQueue.splice(indexToRemove, 1)
 
-                    const indexToRemove = ctx.messageQueue.findIndex((m) => m.queuedAt == queuedAt)
-                    ctx.messageQueue.splice(indexToRemove, 1)
+                const typoContent = Math.random() < 0.07 ? typoify(content) : null
+                const sendContent = typoContent ?? content
 
-                    const typoContent = Math.random() < 0.15 ? typoify(response.content) : null
-                    const sendContent = typoContent ?? response.content
-
-                    let sent: Message | undefined
-                    if (response.replyTo) {
-                        try {
-                            const replyMessage = await message.channel.messages.fetch(response.replyTo)
-                            sent = await replyMessage.reply({ content: sendContent }).catch(() => undefined)
-                        } catch {
-                            sent = await message.channel.send({ content: sendContent }).catch(() => undefined)
-                        }
-                    } else {
+                let sent: Message | undefined
+                if (opts.replyTo) {
+                    try {
+                        const replyMsg = await message.channel.messages.fetch(opts.replyTo)
+                        sent = await replyMsg.reply({ content: sendContent }).catch(() => undefined)
+                    } catch {
                         sent = await message.channel.send({ content: sendContent }).catch(() => undefined)
                     }
-                    if (sent) {
-                        contextManager.trackSentMessage(message.channelId, sent.id)
-                        if (typoContent) {
-                            const editDelay = 3000 + Math.random() * 5000
-                            console.log(`typo in ${sent.id}, fixing in ${(editDelay / 1000).toFixed(1)}s`)
-                            ctx.timeouts.push(setTimeout(async () => {
-                                try {
-                                    await sent.edit({ content: response.content })
-                                } catch { }
-                            }, editDelay))
+                } else {
+                    sent = await message.channel.send({ content: sendContent }).catch(() => undefined)
+                }
+
+                if (!content && opts.react) {
+                    // have to process reacts seperately in the case of there not being content
+
+                    for (const r of opts.react) {
+                        try {
+                            const target = await message.channel.messages.fetch(r.messageId)
+                            if (!target) return console.log(`no message to react to for ${r.messageId}`)
+                            await target.react(r.emoji)
+                            console.log(`reacted ${r.emoji} to ${r.messageId}`)
+                        } catch (err) {
+                            console.error(err)
+                            console.log(`failed to react ${r.emoji} to ${r.messageId}`)
                         }
                     }
-                }, delayTime))
-            }
-        } catch {
-            await this.handleMessage(
-                message,
-                `you tried to send "${text}" but it wasnt properly formatted json. try again please!\n`,
-                signal
-            )
+                }
+
+
+                if (sent) {
+                    contextManager.trackSentMessage(message.channelId, sent.id)
+                    if (opts.react) {
+                        for (const r of opts.react) {
+                            try {
+                                const target = r.messageId === "this" ? sent : await message.channel.messages.fetch(r.messageId)
+                                await target.react(r.emoji)
+                                console.log(`reacted ${r.emoji} to ${r.messageId}`)
+                            } catch (err) {
+                                console.error(err)
+                                console.log(`failed to react ${r.emoji} to ${r.messageId}`)
+                            }
+                        }
+                    }
+                    if (typoContent) {
+                        const editDelay = 3000 + Math.random() * 5000
+                        console.log(`typo in ${sent.id}, fixing in ${(editDelay / 1000).toFixed(1)}s`)
+                        ctx.timeouts.push(setTimeout(async () => {
+                            try {
+                                await sent.edit({ content: content })
+                            } catch { }
+                        }, editDelay))
+                    }
+                }
+            }, delayTime))
         }
+
     }
 }
 

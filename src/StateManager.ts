@@ -19,16 +19,22 @@ class StateManager {
 
     async initial(key: string) {
         const state = createInitialState(key)
+        const channel = await client.channels.fetch(key) as TextChannel
 
-        let context = memoryManager.getChannelContext(key)
+
+        let context = [
+            `id: ${channel.id}`,
+            `name: ${channel.name}`,
+            `type: ${channel.type}`,
+            memoryManager.getChannelContext(key)
+        ].join("\n")
 
         // fetch recent discord messages for context
         try {
-            const channel = await client.channels.fetch(key) as TextChannel
             if (channel?.isText()) {
                 const messages = await channel.messages.fetch({ limit: RECENT_MESSAGE_LIMIT })
                 const formatted = messages.reverse().map(m =>
-                    `[${m.author.displayName}]: ${m.content}`
+                    `[${new Date(m.createdTimestamp).toDateString()} ${new Date(m.createdTimestamp).toTimeString()}][${m.author.displayName}]: ${m.content}`
                 ).join("\n")
                 if (formatted) {
                     context += `\n\nrecent messages in this channel:\n${formatted}`

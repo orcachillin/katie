@@ -29,6 +29,7 @@ class ToolLoader {
             try {
                 const mod = await import(`./tools/${file}`) as Record<string, unknown>
                 for (const [key, val] of Object.entries(mod)) {
+                    if (key == "disabled" && val == true) return
                     if (
                         val &&
                         typeof val === "object" &&

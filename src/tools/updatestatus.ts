@@ -1,6 +1,6 @@
 import { tool } from "@openrouter/agent"
 import z from "zod"
-import type { CustomStatusOption } from "discord.js-selfbot-v13"
+import { CustomStatus, CustomStatusOption, PresenceStatusData } from "discord.js-selfbot-v13"
 import { client } from "../deps.js"
 
 export const updatestatus = tool({
@@ -14,22 +14,27 @@ export const updatestatus = tool({
     outputSchema: z.string(),
     execute: async (params: Record<string, unknown>) => {
         const status = params.status as string | undefined
-        const customStatus = params.customStatus as string | undefined
+        const statusText = params.customStatus as string | undefined
         const emoji = params.emoji as string | undefined
 
+        const customStatus = new CustomStatus(client)
+
+
         if (status) {
-            client.user?.setStatus(status)
+            client.user?.setStatus(status as PresenceStatusData)
         }
 
-        if (customStatus || emoji) {
-            const opts: CustomStatusOption = {}
-            if (customStatus) opts.text = customStatus
-            if (emoji) opts.emoji = emoji as any
-            await client.user?.setCustomStatus(opts).catch(() => {})
+        if (statusText || emoji) {
+            const custom = new CustomStatus(client)
+            custom.setEmoji(emoji)
+            if (statusText) custom.setState(statusText)
+
+            client.user?.setPresence({ activities: [customStatus] })
+
         } else if (!status) {
             return "provide at least one of: status, customStatus"
         }
 
-        return `status updated${status ? ` to ${status}` : ""}${customStatus ? `, custom: ${customStatus}` : ""}`
+        return `status updated${status ? ` to ${status}` : ""}${statusText ? `, custom: ${statusText}` : ""}`
     },
 })
