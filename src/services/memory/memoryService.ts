@@ -38,7 +38,12 @@ export default class MemoryService extends AbstractService<"memory"> {
             memory.content = content;
             memory.updatedAt = new Date();
         } else {
-            memory = new Memory(category, name, content, scopeId);
+            memory = Core.database.repository.memory.create({
+                category,
+                name,
+                content,
+                scopeId,
+            })
         }
 
         const embedding = await Core.services.embedding.embed(content);
@@ -128,22 +133,24 @@ export default class MemoryService extends AbstractService<"memory"> {
 
     private async _searchBySQL(category: MemoryCategory, embedding: number[], scopeId?: string, topK: number = 5): Promise<MemorySearchResult[]> {
         const vecStr = `[${embedding.join(",")}]`;
-        const params: any[] = [vecStr, category, topK];
+        const params: any[] = [vecStr, category];
         let scopeClause = "";
 
         if (scopeId) {
-            scopeClause = `AND "scope_id" = $4`;
+            scopeClause = `AND "scope_id" = ?`;
             params.push(scopeId);
         } else {
             scopeClause = `AND "scope_id" IS NULL`;
         }
 
+        params.push(vecStr, topK);
+
         const rows = await Core.database.em.execute<any[]>(
-            `SELECT id, 1 - ("embedding" <=> $1::vector) AS distance
+            `SELECT id, 1 - ("embedding" <=> ?::vector) AS distance
              FROM "memory"
-             WHERE "category" = $2 ${scopeClause}
-             ORDER BY "embedding" <=> $1::vector
-             LIMIT $3`,
+             WHERE "category" = ? ${scopeClause}
+             ORDER BY "embedding" <=> ?::vector
+             LIMIT ?`,
             params,
         );
 

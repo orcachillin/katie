@@ -14,7 +14,7 @@ export default class EmbeddingService extends AbstractService<"embedding"> {
 
     constructor() {
         super("embedding");
-        this.apiKey = env.OPENROUTER_KEY || env.AI_KEY!;
+        this.apiKey = env.EMBEDDING_KEY || env.OPENROUTER_KEY || env.AI_KEY!;
         this.apiUrl = (env.EMBEDDING_URL || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
         this.model = env.EMBEDDING_MODEL || "text-embedding-3-small";
     }
@@ -32,6 +32,8 @@ export default class EmbeddingService extends AbstractService<"embedding"> {
             throw new Error("Embedding service not configured: no AI_KEY");
         }
 
+        this.logger.log(`embedding (${text.slice(0, 60)}...)`);
+
         const response = await fetch(`${this.apiUrl}/embeddings`, {
             method: "POST",
             headers: {
@@ -46,17 +48,22 @@ export default class EmbeddingService extends AbstractService<"embedding"> {
 
         if (!response.ok) {
             const body = await response.text();
+            this.logger.error(`embedding API error: ${response.status} ${body}`);
             throw new Error(`Embedding API error ${response.status}: ${body}`);
         }
 
         const data = (await response.json()) as EmbeddingResponse;
-        return data.data[0].embedding;
+        const vec = data.data[0].embedding;
+        this.logger.log(`got embedding (${vec.length}d)`);
+        return vec;
     }
 
     async embedBatch(texts: string[]): Promise<number[][]> {
         if (!this.apiKey) {
             throw new Error("Embedding service not configured: no AI_KEY");
         }
+
+        this.logger.log(`embedding batch (${texts.length} texts)`);
 
         const response = await fetch(`${this.apiUrl}/embeddings`, {
             method: "POST",
@@ -72,10 +79,12 @@ export default class EmbeddingService extends AbstractService<"embedding"> {
 
         if (!response.ok) {
             const body = await response.text();
+            this.logger.error(`embedding batch API error: ${response.status} ${body}`);
             throw new Error(`Embedding API error ${response.status}: ${body}`);
         }
 
         const data = (await response.json()) as EmbeddingResponse;
+        this.logger.log(`got ${data.data.length} embeddings`);
         return data.data.map(d => d.embedding);
     }
 

@@ -55,13 +55,15 @@ export default class ToolService extends AbstractService<"tool"> {
         if (!tool) return `unknown tool "${name}"`;
 
         const start = Date.now();
-        this.logger.log(`tool call: ${name}`, args);
+        this.logger.log(`tool call: ${name}`, Object.entries(args).map(a => `${a[0]}:${a[1]}`).join(", "));
         try {
             const result = await tool.function.execute(args, ctx);
             this.logger.log(`tool done: ${name} (${Date.now() - start}ms)`);
+            this.logger.debug(`tool result" ${result}`)
             return result;
         } catch (err: any) {
             this.logger.log(`tool error: ${name} (${Date.now() - start}ms): ${err.message}`);
+            console.error(err)
             return `tool error: ${err.message}`;
         }
     }

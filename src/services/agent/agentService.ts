@@ -69,7 +69,7 @@ export default class AgentService extends AbstractService<"agent"> {
         super("agent");
         this.apiKey = process.env.AI_KEY!;
         this.apiUrl = (process.env.AI_URL || "https://api.neuralwatt.com/v1").replace(/\/+$/, "");
-        this.defaultModel = process.env.AI_MODEL || "qwen3.6-35b-fast";
+        this.defaultModel = process.env.AI_MODEL || "glm-5.2";
     }
 
     public async init(): Promise<void> {
@@ -88,13 +88,16 @@ export default class AgentService extends AbstractService<"agent"> {
     public async destroy(): Promise<void> { }
 
     async chat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResponse> {
+        const model = options?.model || this.defaultModel;
+        this.logger.log(`chat (${messages.length} msgs, ${model})`);
+
         const fullMessages: ChatMessage[] = [
             { role: "system", content: this.getSystemPrompt() },
             ...messages,
         ];
 
         const body: Record<string, unknown> = {
-            model: options?.model || this.defaultModel,
+            model,
             messages: fullMessages,
             temperature: options?.temperature ?? 0.7,
             max_tokens: options?.maxTokens ?? 1024,
@@ -117,19 +120,23 @@ export default class AgentService extends AbstractService<"agent"> {
 
         if (!response.ok) {
             const text = await response.text();
+            this.logger.error(`chat API error ${response.status}: ${text}`);
             throw new Error(`LLM API error ${response.status}: ${text}`);
         }
 
         const data = (await response.json()) as any;
         const choice = data.choices?.[0];
+        const content = choice?.message?.content ?? null;
+        const toolCalls = choice?.message?.tool_calls?.map((tc: any) => ({
+            id: tc.id,
+            name: tc.function.name,
+            arguments: tc.function.arguments,
+        }));
 
+        this.logger.log(`chat done: ${content?.length ?? 0} chars, ${toolCalls?.length ?? 0} tool calls`);
         return {
-            content: choice?.message?.content ?? null,
-            toolCalls: choice?.message?.tool_calls?.map((tc: any) => ({
-                id: tc.id,
-                name: tc.function.name,
-                arguments: tc.function.arguments,
-            })),
+            content,
+            toolCalls,
             raw: choice?.message && {
                 role: "assistant",
                 content: choice.message.content,
@@ -147,27 +154,35 @@ export default class AgentService extends AbstractService<"agent"> {
 
     private getSystemPrompt(): string {
         const now = new Date();
-        const dateStr = now.toLocaleString("en-US", {
-            weekday: "long",
-            year: "numeric",
-            month: "long",
-            day: "numeric",
-            hour: "2-digit",
-            minute: "2-digit",
-            timeZoneName: "short",
-        });
+        const dateStr = AgentService.formatDate(now)
 
         return `${this.systemPrompt}\n\nCurrent date and time: ${dateStr}`;
     }
 
+    public static formatDate(date: Date) {
+        return date.toLocaleString("en-US", {
+            weekday: "short",
+            year: "numeric",
+            month: "short",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            timeZoneName: "short",
+        });
+    }
+
     async *chatStream(messages: ChatMessage[], options?: ChatOptions): AsyncGenerator<StreamChunk> {
+        const model = options?.model || this.defaultModel;
+        this.logger.log(`chatStream (${messages.length} msgs, ${model})`);
+
         const fullMessages: ChatMessage[] = [
             { role: "system", content: this.getSystemPrompt() },
             ...messages,
         ];
 
         const body: Record<string, unknown> = {
-            model: options?.model || this.defaultModel,
+            model,
             messages: fullMessages,
             temperature: options?.temperature ?? 0.7,
             max_tokens: options?.maxTokens ?? 1024,
@@ -191,6 +206,7 @@ export default class AgentService extends AbstractService<"agent"> {
 
         if (!response.ok) {
             const text = await response.text();
+            this.logger.error(`chatStream API error ${response.status}: ${text}`);
             throw new Error(`LLM API error ${response.status}: ${text}`);
         }
 
@@ -209,15 +225,15 @@ export default class AgentService extends AbstractService<"agent"> {
                 const trimmed = line.trim();
                 if (!trimmed || !trimmed.startsWith("data: ")) continue;
                 const data = trimmed.slice(6);
-                if (data === "[DONE]") return;
+                if (data === "[DONE]") {
+                    this.logger.log("chatStream done");
+                    return;
+                }
 
                 try {
                     const parsed = JSON.parse(data);
                     const delta = parsed.choices?.[0]?.delta;
                     const finishReason = parsed.choices?.[0]?.finish_reason;
-
-                    this.logger.debug(delta)
-                    this.logger.debug(`finish reason: ${finishReason}`)
 
                     if (!delta) {
                         if (finishReason) yield { finishReason };

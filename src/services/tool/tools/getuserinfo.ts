@@ -1,5 +1,6 @@
 import Core from "../../../core.js";
 import { User } from "../../../database/entities/UserData.entity.js";
+import XML from "../../../util/xml.js";
 import type { Tool } from "../toolService.js";
 
 export const getuserinfo = {
@@ -18,9 +19,11 @@ export const getuserinfo = {
             const repo = Core.database.repository.user;
             let user = await repo.findOne(args.userId as string);
             if (!user) {
-                const discordUser = await Core.services.bot.getClient().users.fetch(args.userId as string);
+                const discordUser = await Core.services.bot.getClient().users.fetch(args.userId as string).catch((err) => undefined)
+                if (!discordUser) return "couldn't find that user. make sure youre passing in the id correctly, and that youre passing in a user id, not a channel id.";
+
+
                 const profile = await discordUser.getProfile()
-                if (!discordUser) return "couldn't find that user on discord either";
                 user = new User();
                 user.id = discordUser.id;
                 user.username = discordUser.username;
@@ -30,12 +33,14 @@ export const getuserinfo = {
                 Core.database.em.persist(user);
                 await Core.database.em.flush();
             }
-            return [
-                `username: ${user.username}`,
-                `displayName: ${user.displayName}`,
-                `pronouns: ${user.pronouns}`,
-                `bio: ${user.bio}`,
-            ].join("\n");
+            return XML.format("user", {
+                id: user.id,
+                username: user.displayName,
+                pronouns: user.pronouns || undefined,
+                bio: user.bio || undefined
+            })
+
+
         },
     },
 } satisfies Tool;

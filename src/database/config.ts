@@ -46,8 +46,7 @@ export const DatabaseConfig: Parameters<typeof defineConfig<PostgreSqlDriver, En
     dbName: process.env.DB_NAME || "nitr",
     host: process.env.DB_HOST || "localhost",
     port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : 5432,
-    // debug: process.env.DEBUG === "true" || process.env.DB_DEBUG === "true",
-    debug: true,
+    debug: process.env.DEBUG === "true" || process.env.DB_DEBUG === "true",
 
     seeder: {
         path: "dist/database/seeders",

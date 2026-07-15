@@ -1,4 +1,4 @@
-import { Client, TextBasedChannel, type Message } from "discord.js-selfbot-v13";
+import { Client, GuildTextBasedChannel, TextBasedChannel, type Message } from "discord.js-selfbot-v13";
 import { ChannelType } from "discord-api-types/v10";
 import AbstractService from "../../base/abstractService.js";
 import Core from "../../core.js";
@@ -7,6 +7,8 @@ import { User } from "../../database/entities/UserData.entity.js";
 import ChannelContext from "./channelContext.js";
 import type { ChatMessage } from "../agent/agentService.js";
 import type { ToolContext } from "../tool/toolService.js";
+import XML from "../../util/xml.js";
+import AgentService from "../agent/agentService.js";
 
 interface PendingBatch {
     messages: Message[];
@@ -67,9 +69,9 @@ export default class BotService extends AbstractService<"bot"> {
         if (msg.author.id === this.client.user!.id) return;
         if (msg.author.bot) return;
 
-        this.saveUserInfo(msg);
+        this.logger.log(`msg from ${msg.author.displayName} in #${(msg.channel as any).name ?? msg.channelId}: ${msg.content.slice(0, 80)}`);
 
-        this.clearQueue(msg.channelId);
+        this.saveUserInfo(msg);
 
         const existing = this.batches.get(msg.channelId);
         if (existing) {
@@ -110,7 +112,6 @@ export default class BotService extends AbstractService<"bot"> {
         const channel = batch.messages[0].channel;
         const latest = batch.messages[batch.messages.length - 1];
 
-
         const isDM = channel.type == "DM"
         const isGroup = channel.type == "GROUP_DM"
 
@@ -119,10 +120,21 @@ export default class BotService extends AbstractService<"bot"> {
             if (!should) return this.logger.log("chose not to respond")
         }
 
+        const queue = this.getQueue(channelId)
+        this.clearQueue(channelId)
+
+        const queued: ChatMessage = {
+            role: "assistant",
+            content: queue.pending.map(m => XML.format("queuedMessage", { sendingIn: `${Date.now() - m.sendAt}` }, m.content)).join("\n")
+        }
+        this.context.append(channelId, queued)
+
+        this.logger.log(`processing ${batch.messages.length} msgs from ${latest.author.displayName} in ${isDM ? "DM" : isGroup ? "group" : "guild"}`);
+
         const userMsg: ChatMessage = {
             role: "user",
             content: batch.messages.map(m =>
-                `<message from="${m.author.displayName}" id="${m.id}">${m.content}</message>`
+                XML.format("message", { from: m.author.id, id: m.id, replyTo: m.type == "REPLY" ? m.reference?.messageId : undefined, timestamp: m.createdTimestamp.toString() }, m.content)
             ).join("\n"),
         };
         this.context.append(channelId, userMsg);
@@ -173,6 +185,8 @@ export default class BotService extends AbstractService<"bot"> {
             accumulatedDelay += messageDelay;
             const sendAt = Date.now() + accumulatedDelay;
 
+            this.logger.info(`[${accumulatedDelay}ms] sending... ${content}`)
+
             const queued: QueuedMessage = {
                 content,
                 replyTo: opts.replyTo,
@@ -204,6 +218,11 @@ export default class BotService extends AbstractService<"bot"> {
                                 : await channel.send(payload).catch(() => undefined);
                         } else {
                             sent = await channel.send(payload).catch(() => undefined);
+                        }
+                        if (sent) {
+                            this.logger.log(`sent message ${sent.id}`);
+                        } else {
+                            this.logger.warn(`failed to send: ${content.slice(0, 60)}`);
                         }
                     }
 
@@ -247,59 +266,58 @@ export default class BotService extends AbstractService<"bot"> {
     }
 
     private async run(channelId: string, toolCtx: ToolContext, signal: AbortSignal, enqueue: (text: string) => Promise<void>): Promise<void> {
+        const channel = this.client.channels.cache.get(channelId) as TextBasedChannel
         const messages = [...this.context.get(channelId)];
 
+        messages.unshift({
+            role: "system",
+            content: XML.format("channel", { id: channel.id, type: channel.type, name: Object.hasOwn(channel, "name") ? (channel as GuildTextBasedChannel).name : undefined })
+        })
+
         if (messages.length == 0) {
-            const recentContent = (await (this.client.channels.cache.get(channelId) as TextBasedChannel).messages.fetch())
-                .map(m =>
-                    `[${m.author.displayName}]: ${m.content}`
-                ).join("\n");
 
             messages.unshift({
                 role: "user",
-                content: `recent messages\n\n${recentContent}`
+                content: (await channel.messages.fetch())
+                    .map(m =>
+                        XML.format("recentMessage", { id: m.id, authorId: m.author.id, createdAt: AgentService.formatDate(m.createdAt) }, m.content)
+                    ).join("\n")
             })
         }
 
+        let loop = 0;
+
         while (true) {
             if (signal.aborted) return;
+            loop++;
+            this.logger.log(`run loop ${loop}`);
 
-            let content = "";
-            const toolCallsAcc = new Map<number, { id: string; name: string; arguments: string }>();
-
-            for await (const chunk of Core.services.agent.chatStream(messages, {
+            const response = await Core.services.agent.chat(messages, {
                 tools: Core.services.tool.definitions,
                 signal,
-            })) {
-                if (chunk.content) content += chunk.content;
-                if (chunk.toolCall) {
-                    const existing = toolCallsAcc.get(chunk.toolCall.index) || { id: "", name: "", arguments: "" };
-                    if (chunk.toolCall.id) existing.id = chunk.toolCall.id;
-                    if (chunk.toolCall.name) existing.name = chunk.toolCall.name;
-                    if (chunk.toolCall.arguments) existing.arguments += chunk.toolCall.arguments;
-                    toolCallsAcc.set(chunk.toolCall.index, existing);
-                }
-            }
+            });
 
             if (signal.aborted) return;
 
-            const raw: any = { role: "assistant", content: content || null };
-            const toolCalls = [...toolCallsAcc.values()].filter(tc => tc.name);
-            if (toolCalls.length) {
-                raw.tool_calls = toolCalls.map(tc => ({
+            const raw: any = { role: "assistant", content: response.content };
+            if (response.toolCalls?.length) {
+                raw.tool_calls = response.toolCalls.map(tc => ({
                     id: tc.id,
+                    type: "function",
                     function: { name: tc.name, arguments: tc.arguments },
                 }));
             }
             messages.push(raw);
 
-            if (content) {
-                await enqueue(content);
+            if (response.content) {
+                await enqueue(response.content);
             }
 
-            if (!toolCalls.length) break;
+            if (!response.toolCalls?.length) break;
 
-            for (const tc of toolCalls) {
+            this.logger.log(`tool calls: ${response.toolCalls.map(tc => tc.name).join(", ")}`);
+
+            for (const tc of response.toolCalls) {
                 const result = await Core.services.tool.execute(tc.name, JSON.parse(tc.arguments), toolCtx);
                 messages.push({
                     role: "tool",
@@ -313,6 +331,7 @@ export default class BotService extends AbstractService<"bot"> {
     }
 
     private async shouldRespond(messages: Message[]): Promise<boolean> {
+        this.logger.log("checking shouldRespond");
         const channelId = messages[0].channelId;
         const channelCtx = await Core.services.memory.readContent(MemoryCategory.Channel, "info", channelId);
         const userContexts: string[] = [];
