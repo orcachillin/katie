@@ -18,7 +18,16 @@
 		"alwaysStrict": true,
 		"skipLibCheck": true,
 		"experimentalDecorators": true,
-		"emitDecoratorMetadata": true
+		"emitDecoratorMetadata": true,
+
+		"jsx": "react-jsx",
+		"jsxImportSource": "@kitajs/html",
+		"plugins": [
+			{
+				"name": "@kitajs/ts-html-plugin"
+			}
+		],
+		"types": ["@kitajs/html/htmx.d.ts", "node"]
 	},
 	"include": ["src"],
 	"exclude": ["node_modules", "dist"]

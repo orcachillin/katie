@@ -1,35 +1,57 @@
 {
-  "name": "katie",
+  "name": "nitr",
   "version": "1.0.0",
-  "description": "",
+  "description": "the modern, server side only web framework",
   "main": "dist/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "init": "docker compose up -d db redis && tsc && npx mikro-orm schema:fresh -r && concurrently -n tsc,node,vite \"npx tsc\" \"npx vite build\"",
+    "dev": "docker compose up -d db redis && tsc && npx mikro-orm schema:update -r && concurrently -n tsc,node,vite \"npx tsc --watch\" \"node --watch dist/index.js --dev\" \"npx vite build --watch\""
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/orcachillin/katie.git"
+    "url": "git+https://github.com/orcachillin/nitr.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "bugs": {
-    "url": "https://github.com/orcachillin/katie/issues"
+    "url": "https://github.com/orcachillin/nitr/issues"
   },
-  "homepage": "https://github.com/orcachillin/katie#readme",
+  "homepage": "https://github.com/orcachillin/nitr#readme",
+  "devDependencies": {
+    "@mikro-orm/cli": "^7.1.4",
+    "@mikro-orm/reflection": "^7.1.4",
+    "@oxc-node/core": "^0.1.0",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.9.3",
+    "concurrently": "^10.0.3",
+    "htmx-ext-preload": "^2.1.2",
+    "htmx-ext-sse": "^2.2.4",
+    "htmx.org": "^2.0.10",
+    "idiomorph": "^0.7.4",
+    "reflect-metadata": "^0.2.2",
+    "sass": "^1.101.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16"
+  },
   "dependencies": {
-    "@openrouter/agent": "^0.7.1",
-    "@openrouter/sdk": "^0.12.79",
+    "@kitajs/html": "^4.2.13",
+    "@mikro-orm/core": "^7.1.4",
+    "@mikro-orm/decorators": "^7.1.4",
+    "@mikro-orm/migrations": "^7.1.4",
+    "@mikro-orm/postgresql": "^7.1.4",
+    "@paralleldrive/cuid2": "^3.3.0",
+    "bootstrap": "^5.3.8",
+    "chalk": "^5.6.2",
     "cheerio": "^1.2.0",
-    "debug": "^4.4.3",
-    "discord.js": "^14.26.4",
+    "cookie-parser": "^1.4.7",
     "discord.js-selfbot-v13": "^3.7.1",
     "dotenv": "^17.4.2",
-    "pm2": "^7.0.1",
-    "zod": "^4.4.3"
-  },
-  "devDependencies": {
-    "typescript": "^6.0.3"
+    "express": "^5.2.1",
+    "openai": "^6.45.0",
+    "redis": "^6.1.0"
   }
 }
