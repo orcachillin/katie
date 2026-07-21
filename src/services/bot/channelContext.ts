@@ -34,4 +34,8 @@ export default class ChannelContext {
     has(channelId: string): boolean {
         return !!this.channels[channelId]
     }
+
+    all(): Record<string, ChatMessage[]> {
+        return this.channels;
+    }
 }

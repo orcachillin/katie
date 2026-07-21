@@ -14,21 +14,29 @@ export default class SSEService extends AbstractService<"sse"> {
 
     public async init(): Promise<void> {
         Core.services.web.app.get("/events/:channel", async (req, res) => {
-            const channel = req.params.channel
-
+            const channelId = req.params.channel
             const session = Core.services.context.get<Session>("session");
-            if (!session) {
-                res.status(401).end();
+
+            const channel = this.findChannel(channelId);
+            if (!channel) {
+                res.status(404).send(`No channel [${channelId}] registered`);
                 return;
             }
 
-            const check = await this.addClient(channel, session, res)
-
-            if (!check) {
-                res.status(401).send(`You are not authorized to connect to channel [${channel}]`)
-                this.logger.warn(`Session(${session.id}) tried to connect to Channel(${channel}) but is not permitted to.`)
-                return
+            if (channel.config.permissionCheck) {
+                if (!session) {
+                    res.status(401).end();
+                    return;
+                }
+                const allowed = await channel.config.permissionCheck(session, channelId.match(channel.config.pattern)?.groups ?? {});
+                if (!allowed) {
+                    res.status(401).send(`You are not authorized to connect to channel [${channelId}]`);
+                    this.logger.warn(`Session(${session.id}) tried to connect to Channel(${channelId}) but is not permitted to.`);
+                    return;
+                }
             }
+
+            channel.addClient(channelId, session ?? { id: "anon" } as any, res);
 
             res.writeHead(200, {
                 "Content-Type": "text/event-stream",
@@ -46,9 +54,14 @@ export default class SSEService extends AbstractService<"sse"> {
 
             res.on("close", () => {
                 clearInterval(keepalive);
+                channel.removeClient((session ?? { id: "anon" }).id, res);
             });
         });
 
+    }
+
+    private findChannel(channelId: string): SSEChannel | undefined {
+        return this.channels.find(c => c.matches(channelId));
     }
 
     public registerChannel(config: ChannelConfig, id?: string): SSEChannel {

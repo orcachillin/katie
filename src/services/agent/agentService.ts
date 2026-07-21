@@ -31,6 +31,7 @@ export interface ChatOptions {
     tools?: ToolDefinition[];
     toolChoice?: "auto" | "none" | { type: "function"; function: { name: string } };
     signal?: AbortSignal;
+    stripSystemPrompt?: boolean
 }
 
 export interface ChatResponse {
@@ -91,7 +92,7 @@ export default class AgentService extends AbstractService<"agent"> {
         const model = options?.model || this.defaultModel;
         this.logger.log(`chat (${messages.length} msgs, ${model})`);
 
-        const fullMessages: ChatMessage[] = [
+        const fullMessages: ChatMessage[] = options?.stripSystemPrompt ? messages : [
             { role: "system", content: this.getSystemPrompt() },
             ...messages,
         ];
@@ -101,6 +102,9 @@ export default class AgentService extends AbstractService<"agent"> {
             messages: fullMessages,
             temperature: options?.temperature ?? 0.7,
             max_tokens: options?.maxTokens ?? 1024,
+            provider: {
+                ignore: ["Inceptron", "Morph"]
+            }
         };
 
         if (options?.tools?.length) {
@@ -152,7 +156,7 @@ export default class AgentService extends AbstractService<"agent"> {
         };
     }
 
-    private getSystemPrompt(): string {
+    public getSystemPrompt(): string {
         const now = new Date();
         const dateStr = AgentService.formatDate(now)
 

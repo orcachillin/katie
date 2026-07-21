@@ -20,6 +20,10 @@ export default class ClientService extends AbstractService<"client"> {
 
         Core.services.web.addRoute("/-", componentRouter)
 
+        Core.services.sse.registerChannel({
+            pattern: /^contexts$/,
+        });
+
         Core.services.web.app.get("*root", (req, res) => {
             const rid = Core.services.context.rid!
 
@@ -29,5 +33,10 @@ export default class ClientService extends AbstractService<"client"> {
 
             stream.pipe(res)
         })
+    }
+
+    public async pushContextUpdate(): Promise<void> {
+        const html = await this.componentCache.render("pages.contexts", {});
+        Core.services.sse.sendToChannel("contexts", "contextUpdate", html);
     }
 }

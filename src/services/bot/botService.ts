@@ -61,6 +61,10 @@ export default class BotService extends AbstractService<"bot"> {
         return this.client;
     }
 
+    public getContexts(): Record<string, ChatMessage[]> {
+        return this.context.all();
+    }
+
     public async destroy(): Promise<void> {
         this.client.destroy();
     }
@@ -116,18 +120,20 @@ export default class BotService extends AbstractService<"bot"> {
         const isGroup = channel.type == "GROUP_DM"
 
         if (!isDM && !isGroup && !latest.mentions.users.has(this.client.user!.id)) {
-            const should = await this.shouldRespond(batch.messages);
+            const should = await this.shouldRespond(Array.from(channel.messages.cache.values()).sort((a, b) => b.createdTimestamp - a.createdTimestamp).slice(0, 10));
             if (!should) return this.logger.log("chose not to respond")
         }
 
-        const queue = this.getQueue(channelId)
         this.clearQueue(channelId)
 
-        const queued: ChatMessage = {
-            role: "assistant",
-            content: queue.pending.map(m => XML.format("queuedMessage", { sendingIn: `${Date.now() - m.sendAt}` }, m.content)).join("\n")
-        }
-        this.context.append(channelId, queued)
+        // const queue = this.getQueue(channelId)
+        // this.clearQueue(channelId)
+
+        // const queued: ChatMessage = {
+        //     role: "assistant",
+        //     content: queue.pending.map(m => XML.format("queuedMessage", { sendingIn: `${m.sendAt - Date.now()}` }, m.content)).join("\n")
+        // }
+        // this.context.append(channelId, queued)
 
         this.logger.log(`processing ${batch.messages.length} msgs from ${latest.author.displayName} in ${isDM ? "DM" : isGroup ? "group" : "guild"}`);
 
@@ -163,11 +169,12 @@ export default class BotService extends AbstractService<"bot"> {
         defaultReplyTo: string,
     ): Promise<void> {
         const q = this.getQueue(channelId);
-        const rawMessages = text.split("\n\n").filter(Boolean);
+        const parsedMessages = this.parseXMLMessages(text);
         let accumulatedDelay = 0;
 
-        for (const raw of rawMessages) {
-            const { text: content, opts } = this.parseHeader(raw);
+        for (const parsed of parsedMessages) {
+            let content = parsed.text;
+            const opts = parsed.opts;
             const reactions = opts.react?.split(";").map(pair => {
                 const colon = pair.lastIndexOf(":");
                 return {
@@ -179,13 +186,26 @@ export default class BotService extends AbstractService<"bot"> {
             if (!content && !reactions?.length) continue;
 
             const wordCount = content.split(/\s+/).filter(Boolean).length;
-            let messageDelay = opts.delayTime ?? Math.min(8000, Math.max(1000, wordCount * 400));
-            if (messageDelay < 500) messageDelay = 500;
+            let messageDelay = opts.delayTime ?? Math.max(1000, wordCount * 1600) + (Math.random() * 6000)
 
             accumulatedDelay += messageDelay;
             const sendAt = Date.now() + accumulatedDelay;
 
             this.logger.info(`[${accumulatedDelay}ms] sending... ${content}`)
+
+            // dedup
+            if (q.pending.find(v => v.content == content)) {
+                this.logger.warn(`duplicated message found in content, skipping...`)
+                continue
+            }
+
+            // catches
+
+            const illegal = ["</arg_value>", "</tool_call>"]
+
+            for (const i of illegal) {
+                content = content.replaceAll(i, "")
+            }
 
             const queued: QueuedMessage = {
                 content,
@@ -198,7 +218,7 @@ export default class BotService extends AbstractService<"bot"> {
             const typingTimeout = setTimeout(async () => {
                 if (!this.queues.has(channelId)) return;
                 try { await channel.sendTyping(); } catch { }
-            }, accumulatedDelay * 0.1);
+            }, accumulatedDelay * (Math.random() / 2 + 0.5));
             q.timeouts.push(typingTimeout);
 
             const sendTimeout = setTimeout(async () => {
@@ -221,6 +241,7 @@ export default class BotService extends AbstractService<"bot"> {
                         }
                         if (sent) {
                             this.logger.log(`sent message ${sent.id}`);
+
                         } else {
                             this.logger.warn(`failed to send: ${content.slice(0, 60)}`);
                         }
@@ -244,37 +265,66 @@ export default class BotService extends AbstractService<"bot"> {
         }
     }
 
-    private parseHeader(raw: string): { text: string; opts: MessageOptions } {
-        const opts: MessageOptions = {};
-        const stripped = raw.trim();
-        const headerMatch = stripped.match(/^\[([^\]]+)\]\s*/);
-        if (!headerMatch) return { text: stripped, opts };
+    private parseXMLMessages(raw: string): { text: string; opts: MessageOptions }[] {
+        const results: { text: string; opts: MessageOptions }[] = [];
 
-        for (const pair of headerMatch[1].split(",")) {
-            const eqIdx = pair.indexOf("=");
-            const colonIdx = pair.indexOf(":");
-            const sepIdx = eqIdx !== -1 ? eqIdx : colonIdx;
-            if (sepIdx === -1) continue;
-            const key = pair.slice(0, sepIdx).trim().toLowerCase();
-            const val = pair.slice(sepIdx + 1).trim();
-            if (key === "delaytime" || key === "t") opts.delayTime = Number(val);
-            if (key === "replyto" || key === "r") opts.replyTo = val;
-            if (key === "react") opts.react = val;
+        // Match <message ...>...</message> or standalone <react .../>
+        const regex = /<message\b([^>]*)>([\s\S]*?)<\/message>|<react\b([^>]*)\/>/g;
+        let match: RegExpExecArray | null;
+
+        while ((match = regex.exec(raw)) !== null) {
+            if (match[1] !== undefined) {
+                // <message> tag
+                const attrs = this.parseXMLAttributes(match[1]);
+                let innerContent = match[2];
+
+                // Check for nested <react/> inside message content
+                const reactMatch = /<react\b([^>]*)\/>/.exec(innerContent);
+                const textContent = innerContent.replace(/<react\b[^>]*\/>/g, "").trim();
+
+                const opts: MessageOptions = {};
+                if (attrs.delay) opts.delayTime = Number(attrs.delay);
+                if (attrs.replyto) opts.replyTo = attrs.replyto;
+                if (reactMatch) {
+                    const reactAttrs = this.parseXMLAttributes(reactMatch[1]);
+                    opts.react = `${reactAttrs.emoji}:${reactAttrs.target}`;
+                }
+
+                results.push({ text: textContent, opts });
+            } else if (match[3] !== undefined) {
+                // Standalone <react/> tag
+                const attrs = this.parseXMLAttributes(match[3]);
+                results.push({
+                    text: "",
+                    opts: { react: `${attrs.emoji}:${attrs.target}` },
+                });
+            }
         }
 
-        return { text: stripped.slice(headerMatch[0].length).trim(), opts };
+        return results;
+    }
+
+    private parseXMLAttributes(attrStr: string): Record<string, string> {
+        const attrs: Record<string, string> = {};
+        const attrRegex = /(\w+)\s*=\s*"([^"]*)"/g;
+        let m: RegExpExecArray | null;
+        while ((m = attrRegex.exec(attrStr)) !== null) {
+            attrs[m[1].toLowerCase()] = m[2];
+        }
+        return attrs;
     }
 
     private async run(channelId: string, toolCtx: ToolContext, signal: AbortSignal, enqueue: (text: string) => Promise<void>): Promise<void> {
         const channel = this.client.channels.cache.get(channelId) as TextBasedChannel
         const messages = [...this.context.get(channelId)];
 
-        messages.unshift({
-            role: "system",
-            content: XML.format("channel", { id: channel.id, type: channel.type, name: Object.hasOwn(channel, "name") ? (channel as GuildTextBasedChannel).name : undefined })
-        })
 
-        if (messages.length == 0) {
+        if (messages.length == 1) {
+
+            messages.unshift({
+                role: "system",
+                content: XML.format("channel", { id: channel.id, type: channel.type, name: Object.hasOwn(channel, "name") ? (channel as GuildTextBasedChannel).name : undefined })
+            })
 
             messages.unshift({
                 role: "user",
@@ -283,6 +333,7 @@ export default class BotService extends AbstractService<"bot"> {
                         XML.format("recentMessage", { id: m.id, authorId: m.author.id, createdAt: AgentService.formatDate(m.createdAt) }, m.content)
                     ).join("\n")
             })
+
         }
 
         let loop = 0;
@@ -349,13 +400,17 @@ export default class BotService extends AbstractService<"bot"> {
         const res = await Core.services.agent.chat([
             {
                 role: "system",
-                content: `you decide if katie would chime in. reply with just "yes" or "no".`,
+                content: `you are a filtering agent. you decide if katie would chime in. her system prompt is provided below with some additional context. reply with just "yes" or "no". do not respond as katie.`,
+            },
+            {
+                role: "user",
+                content: `katie's system prompt: \n\n${Core.services.agent.getSystemPrompt()}`
             },
             {
                 role: "user",
                 content: `channel info: ${channelCtx}\n\n${userContexts.join("\n\n")}\n\nrecent messages:\n${recentContent}`,
             },
-        ], { model: "qwen3.6-35b-fast", maxTokens: 10, temperature: 0.1 });
+        ], { model: "qwen3-14b", temperature: 0.1, stripSystemPrompt: true });
 
         return res.content?.toLowerCase().includes("yes") ?? false;
     }

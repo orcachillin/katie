@@ -62,7 +62,7 @@ export default class MemoryService extends AbstractService<"memory"> {
 
     async readContent(category: MemoryCategory, name: string, scopeId?: string): Promise<string> {
         const memory = await this.read(category, name, scopeId);
-        return memory?.content ?? "this memory doesnt exist yet, use memory to save something!";
+        return memory?.content ?? "";
     }
 
     async list(category: MemoryCategory, scopeId?: string): Promise<string[]> {

@@ -9,11 +9,9 @@ export function MainLayout(props: { children: Children }) {
 					nitr
 				</a>
 				<div class="navbar-links">
-					<Link href="/counter" get="demos.counter">Counter</Link>
-					<Link href="/sse" get="demos.time">SSE</Link>
-				</div>
-				<div class="navbar-links navbar-right">
-					<a href="https://github.com/orcachillin/nitr">Github</a>
+					<Link href="/contexts" get="pages.contexts">
+						Contexts
+					</Link>
 				</div>
 			</nav>
 			<main id="main" class="container" hx-history-elt>
