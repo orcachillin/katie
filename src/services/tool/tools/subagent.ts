@@ -20,7 +20,7 @@ export const subagent = {
             const messages: ChatMessage[] = [
                 {
                     role: "system",
-                    content: "you are a sub-agent working on a delegated task. you have the same capabilities as the primary agent. work through the task step by step using the available tools, then report your findings. be thorough.",
+                    content: Core.services.prompt.get("subagent"),
                 },
                 { role: "user", content: task },
             ];

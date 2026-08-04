@@ -15,6 +15,7 @@ WORKDIR /
 RUN apk add --no-cache postgresql postgresql-client redis bash
 
 COPY --from=build /app/dist /dist
+COPY --from=build /app/prompts /prompts
 COPY --from=build /app/temp /temp
 COPY --from=build /app/node_modules_prod /node_modules
 COPY --from=build /app/package.json /package.json

@@ -5,8 +5,12 @@ import CacheService from "./services/cache/cacheService.js";
 import ClientService from "./services/client/clientService.js";
 import ContextService from "./services/context/contextService.js";
 import EmbeddingService from "./services/embedding/embeddingService.js";
+import ImageService from "./services/image/imageService.js";
+import IncentiveService from "./services/incentive/incentiveService.js";
 import MemoryService from "./services/memory/memoryService.js";
+import PromptService from "./services/prompt/promptService.js";
 import SettingsService from "./services/settings/settingsService.js";
+import SchedulerService from "./services/scheduler/schedulerService.js";
 import SSEService from "./services/sse/sseService.js";
 import ToolService from "./services/tool/toolService.js";
 import WebService from "./services/web/webService.js";
@@ -25,12 +29,16 @@ export default class Core {
      * services are started synchronously in this order.
      */
     public static readonly serviceList = [
+        new PromptService(),
         new CacheService(),
         new SettingsService(),
         new EmbeddingService(),
         new MemoryService(),
         new ToolService(),
         new AgentService(),
+        new ImageService(),
+        new SchedulerService(),
+        new IncentiveService(),
         new BotService(),
         new WebService(),
         new ContextService(),

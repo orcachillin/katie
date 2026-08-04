@@ -12,7 +12,31 @@ import AgentService from "../agent/agentService.js";
 
 interface PendingBatch {
     messages: Message[];
-    controller: AbortController;
+}
+
+export interface ScheduledPromptInput {
+    id: string;
+    channelId: string;
+    userId: string;
+    username: string;
+    messageId: string;
+    prompt: string;
+    dueAt: Date;
+}
+
+export interface IncentiveInput {
+    channelId: string;
+    userId: string;
+    username: string;
+    messageId: string;
+    lastMessageAt: Date;
+}
+
+interface SyntheticPromptInput {
+    channelId: string;
+    userId: string;
+    username: string;
+    messageId: string;
 }
 
 interface QueuedMessage {
@@ -20,11 +44,13 @@ interface QueuedMessage {
     replyTo?: string;
     reactions?: { emoji: string; messageId: string }[];
     sendAt: number;
+    contextMessage: ChatMessage;
 }
 
 interface ChannelQueue {
     timeouts: NodeJS.Timeout[];
     pending: QueuedMessage[];
+    cancelPending: (() => void)[];
 }
 
 interface MessageOptions {
@@ -33,10 +59,21 @@ interface MessageOptions {
     react?: string;
 }
 
+interface EnqueueResult {
+    delivered: boolean;
+    messages: ChatMessage[];
+}
+
+interface ParsedMessage {
+    text: string;
+    opts: MessageOptions;
+    raw: string;
+}
+
 export default class BotService extends AbstractService<"bot"> {
 
     private client!: Client;
-    private batches = new Map<string, PendingBatch>();
+    private activeRuns = new Map<string, AbortController>();
     private context = new ChannelContext();
     private queues = new Map<string, ChannelQueue>();
 
@@ -65,6 +102,72 @@ export default class BotService extends AbstractService<"bot"> {
         return this.context.all();
     }
 
+    public async processScheduledPrompt(input: ScheduledPromptInput): Promise<boolean> {
+        return this.processSyntheticPrompt(input, {
+            role: "user",
+            content: XML.format("scheduledPrompt", {
+                id: input.id,
+                from: input.userId,
+                sourceMessageId: input.messageId,
+                dueAt: input.dueAt.toISOString(),
+            }, input.prompt),
+        });
+    }
+
+    public async processIncentive(input: IncentiveInput): Promise<boolean> {
+        return this.processSyntheticPrompt(input, {
+            role: "user",
+            content: XML.format("incentive", {
+                lastMessageAt: input.lastMessageAt.toISOString(),
+            }, Core.services.prompt.get("incentive")),
+        });
+    }
+
+    private async processSyntheticPrompt(input: SyntheticPromptInput, syntheticMessage: ChatMessage): Promise<boolean> {
+        if (this.activeRuns.has(input.channelId)) return false;
+
+        const controller = new AbortController();
+        this.activeRuns.set(input.channelId, controller);
+        let completed = false;
+
+        try {
+            const channel = await this.client.channels.fetch(input.channelId);
+            if (controller.signal.aborted) return false;
+            if (!channel?.isText()) throw new Error(`channel ${input.channelId} is unavailable or is not text-based`);
+
+            this.context.append(input.channelId, syntheticMessage);
+
+            const toolCtx: ToolContext = {
+                channelId: input.channelId,
+                userId: input.userId,
+                username: input.username,
+                messageId: input.messageId,
+            };
+
+            let delivered = false;
+            await this.run(input.channelId, toolCtx, controller.signal, async (text) => {
+                const result = await this.enqueueMessages(input.channelId, channel as Message["channel"], text, input.messageId, controller.signal);
+                delivered = result.delivered;
+                if (!delivered && !controller.signal.aborted) {
+                    throw new Error("synthetic prompt response could not be sent");
+                }
+                return result;
+            }, channel as TextBasedChannel);
+            completed = !controller.signal.aborted && delivered;
+            return completed;
+        } catch (err: any) {
+            if (err?.name === "AbortError") return false;
+            throw err;
+        } finally {
+            if (!completed) {
+                this.context.remove(input.channelId, syntheticMessage);
+            }
+            if (this.activeRuns.get(input.channelId) === controller) {
+                this.activeRuns.delete(input.channelId);
+            }
+        }
+    }
+
     public async destroy(): Promise<void> {
         this.client.destroy();
     }
@@ -77,42 +180,48 @@ export default class BotService extends AbstractService<"bot"> {
 
         this.saveUserInfo(msg);
 
-        const existing = this.batches.get(msg.channelId);
+        const existing = this.activeRuns.get(msg.channelId);
         if (existing) {
-            existing.controller.abort();
-            this.batches.delete(msg.channelId);
+            existing.abort();
         }
+        this.clearQueue(msg.channelId);
 
         const batch: PendingBatch = {
             messages: [msg],
-            controller: new AbortController(),
         };
-        this.batches.set(msg.channelId, batch);
+        const controller = new AbortController();
+        this.activeRuns.set(msg.channelId, controller);
 
-        await this.process(msg.channelId);
+        try {
+            await this.process(msg.channelId, batch, controller.signal);
+        } finally {
+            if (this.activeRuns.get(msg.channelId) === controller) {
+                this.activeRuns.delete(msg.channelId);
+            }
+        }
     }
 
     private clearQueue(channelId: string): void {
         const q = this.queues.get(channelId);
         if (!q) return;
-        for (const t of q.timeouts) clearTimeout(t);
+        for (const t of q.timeouts) {
+            clearTimeout(t);
+            clearInterval(t);
+        }
         this.queues.delete(channelId);
+        for (const cancel of q.cancelPending) cancel();
     }
 
     private getQueue(channelId: string): ChannelQueue {
         let q = this.queues.get(channelId);
         if (!q) {
-            q = { timeouts: [], pending: [] };
+            q = { timeouts: [], pending: [], cancelPending: [] };
             this.queues.set(channelId, q);
         }
         return q;
     }
 
-    private async process(channelId: string): Promise<void> {
-        const batch = this.batches.get(channelId);
-        if (!batch) return;
-        this.batches.delete(channelId);
-
+    private async process(channelId: string, batch: PendingBatch, signal: AbortSignal): Promise<void> {
         const channel = batch.messages[0].channel;
         const latest = batch.messages[batch.messages.length - 1];
 
@@ -120,11 +229,30 @@ export default class BotService extends AbstractService<"bot"> {
         const isGroup = channel.type == "GROUP_DM"
 
         if (!isDM && !isGroup && !latest.mentions.users.has(this.client.user!.id)) {
-            const should = await this.shouldRespond(Array.from(channel.messages.cache.values()).sort((a, b) => b.createdTimestamp - a.createdTimestamp).slice(0, 10));
+            const should = await this.shouldRespond(Array.from(channel.messages.cache.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp).slice(0, 10));
             if (!should) return this.logger.log("chose not to respond")
         }
 
-        this.clearQueue(channelId)
+        if (signal.aborted) return;
+
+        void Core.services.incentive.recordActivity({
+            channelId,
+            userId: latest.author.id,
+            username: latest.author.displayName,
+            messageId: latest.id,
+            lastMessageAt: latest.createdAt,
+        }).catch(err => this.logger.warn(`failed to record channel activity: ${err?.message ?? err}`));
+
+        let storedImages;
+        try {
+            storedImages = await Promise.all(batch.messages.map(message =>
+                Core.services.image.storeMessageImages(message, signal)
+            ));
+        } catch (err: any) {
+            if (err?.name === "AbortError") return;
+            throw err;
+        }
+        if (signal.aborted) return;
 
         // const queue = this.getQueue(channelId)
         // this.clearQueue(channelId)
@@ -139,9 +267,14 @@ export default class BotService extends AbstractService<"bot"> {
 
         const userMsg: ChatMessage = {
             role: "user",
-            content: batch.messages.map(m =>
-                XML.format("message", { from: m.author.id, id: m.id, replyTo: m.type == "REPLY" ? m.reference?.messageId : undefined, timestamp: m.createdTimestamp.toString() }, m.content)
+            content: batch.messages.map((m, index) =>
+                XML.format(
+                    "message",
+                    { from: m.author.id, id: m.id, replyTo: m.type == "REPLY" ? m.reference?.messageId : undefined, timestamp: m.createdTimestamp.toString() },
+                    [m.content, storedImages[index].context].filter(Boolean).join("\n"),
+                )
             ).join("\n"),
+            images: storedImages.flatMap(result => result.images),
         };
         this.context.append(channelId, userMsg);
 
@@ -153,8 +286,8 @@ export default class BotService extends AbstractService<"bot"> {
         };
 
         try {
-            await this.run(channelId, toolCtx, batch.controller.signal, async (text) => {
-                await this.enqueueMessages(channelId, channel, text, latest.id);
+            await this.run(channelId, toolCtx, signal, async (text) => {
+                return this.enqueueMessages(channelId, channel, text, latest.id, signal);
             });
         } catch (err: any) {
             if (err?.name === "AbortError") return;
@@ -162,15 +295,37 @@ export default class BotService extends AbstractService<"bot"> {
         }
     }
 
-    private async enqueueMessages(
+    private enqueueMessages(
         channelId: string,
         channel: Message["channel"],
         text: string,
         defaultReplyTo: string,
-    ): Promise<void> {
+        signal: AbortSignal,
+    ): Promise<EnqueueResult> {
+        if (signal.aborted) return Promise.resolve({ delivered: false, messages: [] });
+
         const q = this.getQueue(channelId);
-        const parsedMessages = this.parseXMLMessages(text);
+        let parsedMessages = this.parseXMLMessages(text);
         let accumulatedDelay = 0;
+        const sendPromises: Promise<boolean>[] = [];
+        const contextMessages: ChatMessage[] = [];
+
+        // try to cover for improperly tagged messages
+        // check for missing the first character of the tag since it seems to happen a lot
+        if (text.trim().startsWith("message>")) {
+            parsedMessages = this.parseXMLMessages(`<${text}`)
+        }
+
+        // try to cover for non formatted messages
+        if (parsedMessages.length == 0) {
+
+            parsedMessages.push({
+                text,
+                opts: {},
+                raw: text,
+            });
+        }
+
 
         for (const parsed of parsedMessages) {
             let content = parsed.text;
@@ -186,7 +341,8 @@ export default class BotService extends AbstractService<"bot"> {
             if (!content && !reactions?.length) continue;
 
             const wordCount = content.split(/\s+/).filter(Boolean).length;
-            let messageDelay = opts.delayTime ?? Math.max(1000, wordCount * 1600) + (Math.random() * 6000)
+            const readDelay = Math.random() * 8000
+            const messageDelay = opts.delayTime ?? Math.max(1000, wordCount * 900) + readDelay
 
             accumulatedDelay += messageDelay;
             const sendAt = Date.now() + accumulatedDelay;
@@ -207,66 +363,102 @@ export default class BotService extends AbstractService<"bot"> {
                 content = content.replaceAll(i, "")
             }
 
+            const contextMessage: ChatMessage = {
+                role: "assistant",
+                content: parsed.raw,
+                sent: false,
+            };
+            contextMessages.push(contextMessage);
+            this.context.append(channelId, contextMessage);
+
             const queued: QueuedMessage = {
                 content,
                 replyTo: opts.replyTo,
                 reactions,
                 sendAt,
+                contextMessage,
             };
             q.pending.push(queued);
 
-            const typingTimeout = setTimeout(async () => {
-                if (!this.queues.has(channelId)) return;
+            // Send typing immediately, then refresh every 10s until the message sends
+            const sendTyping = async () => {
+                if (signal.aborted || this.queues.get(channelId) !== q) return;
                 try { await channel.sendTyping(); } catch { }
-            }, accumulatedDelay * (Math.random() / 2 + 0.5));
-            q.timeouts.push(typingTimeout);
+            };
+            sendTyping();
+            const typingInterval = setInterval(sendTyping, 10000);
+            q.timeouts.push(typingInterval);
 
-            const sendTimeout = setTimeout(async () => {
-                const idx = q.pending.indexOf(queued);
-                if (idx !== -1) q.pending.splice(idx, 1);
-                if (!this.queues.has(channelId)) return;
+            const sendPromise = new Promise<boolean>((resolve) => {
+                const sendTimeout = setTimeout(async () => {
+                    clearInterval(typingInterval);
+                    const idx = q.pending.indexOf(queued);
+                    if (idx !== -1) q.pending.splice(idx, 1);
+                    if (signal.aborted || this.queues.get(channelId) !== q) { resolve(false); return; }
 
-                try {
-                    let sent: Message | undefined;
+                    try {
+                        let sent: Message | undefined;
+                        let delivered = !content && !queued.reactions?.length;
 
-                    if (content) {
-                        const payload = { content };
-                        if (queued.replyTo) {
-                            const replyMsg = await channel.messages.fetch(queued.replyTo).catch(() => undefined);
-                            sent = replyMsg
-                                ? await replyMsg.reply(payload).catch(() => undefined)
-                                : await channel.send(payload).catch(() => undefined);
-                        } else {
-                            sent = await channel.send(payload).catch(() => undefined);
+                        if (content) {
+                            const payload = { content };
+                            if (queued.replyTo) {
+                                const replyMsg = await channel.messages.fetch(queued.replyTo).catch(() => undefined);
+                                if (signal.aborted || this.queues.get(channelId) !== q) { resolve(false); return; }
+                                sent = replyMsg
+                                    ? await replyMsg.reply(payload).catch(() => undefined)
+                                    : await channel.send(payload).catch(() => undefined);
+                            } else {
+                                sent = await channel.send(payload).catch(() => undefined);
+                            }
+                            if (sent) {
+                                delivered = true;
+                                this.logger.log(`sent message ${sent.id}`);
+
+                            } else {
+                                this.logger.warn(`failed to send: ${content.slice(0, 60)}`);
+                            }
                         }
-                        if (sent) {
-                            this.logger.log(`sent message ${sent.id}`);
 
-                        } else {
-                            this.logger.warn(`failed to send: ${content.slice(0, 60)}`);
+                        const reactionTarget = queued.reactions?.length
+                            ? sent ?? await channel.messages.fetch(defaultReplyTo).catch(() => undefined)
+                            : undefined;
+
+                        if (reactionTarget) {
+                            for (const r of queued.reactions ?? []) {
+                                if (signal.aborted || this.queues.get(channelId) !== q) break;
+                                const target = r.messageId === "this"
+                                    ? reactionTarget
+                                    : await channel.messages.fetch(r.messageId).catch(() => undefined);
+                                if (signal.aborted || this.queues.get(channelId) !== q) break;
+                                if (target) {
+                                    const reacted = await target.react(r.emoji).then(() => true).catch(() => false);
+                                    delivered ||= reacted;
+                                }
+                            }
                         }
+                        if (delivered) {
+                            this.context.markSent(channelId, queued.contextMessage);
+                        }
+                        resolve(delivered);
+                    } catch {
+                        resolve(false);
                     }
-
-                    const reactionTarget = queued.reactions?.length
-                        ? sent ?? await channel.messages.fetch(defaultReplyTo).catch(() => undefined)
-                        : undefined;
-
-                    if (reactionTarget) {
-                        for (const r of queued.reactions ?? []) {
-                            const target = r.messageId === "this"
-                                ? reactionTarget
-                                : await channel.messages.fetch(r.messageId).catch(() => undefined);
-                            if (target) await target.react(r.emoji).catch(() => { });
-                        }
-                    }
-                } catch { }
-            }, accumulatedDelay);
-            q.timeouts.push(sendTimeout);
+                }, accumulatedDelay);
+                q.timeouts.push(sendTimeout);
+                q.cancelPending.push(() => resolve(false));
+            });
+            sendPromises.push(sendPromise);
         }
+
+        return Promise.all(sendPromises).then(results => {
+            const delivered = results.every(Boolean);
+            return { delivered, messages: contextMessages };
+        });
     }
 
-    private parseXMLMessages(raw: string): { text: string; opts: MessageOptions }[] {
-        const results: { text: string; opts: MessageOptions }[] = [];
+    private parseXMLMessages(raw: string): ParsedMessage[] {
+        const results: ParsedMessage[] = [];
 
         // Match <message ...>...</message> or standalone <react .../>
         const regex = /<message\b([^>]*)>([\s\S]*?)<\/message>|<react\b([^>]*)\/>/g;
@@ -290,13 +482,14 @@ export default class BotService extends AbstractService<"bot"> {
                     opts.react = `${reactAttrs.emoji}:${reactAttrs.target}`;
                 }
 
-                results.push({ text: textContent, opts });
+                results.push({ text: textContent, opts, raw: match[0] });
             } else if (match[3] !== undefined) {
                 // Standalone <react/> tag
                 const attrs = this.parseXMLAttributes(match[3]);
                 results.push({
                     text: "",
                     opts: { react: `${attrs.emoji}:${attrs.target}` },
+                    raw: match[0],
                 });
             }
         }
@@ -314,25 +507,35 @@ export default class BotService extends AbstractService<"bot"> {
         return attrs;
     }
 
-    private async run(channelId: string, toolCtx: ToolContext, signal: AbortSignal, enqueue: (text: string) => Promise<void>): Promise<void> {
-        const channel = this.client.channels.cache.get(channelId) as TextBasedChannel
+    private async run(
+        channelId: string,
+        toolCtx: ToolContext,
+        signal: AbortSignal,
+        enqueue: (text: string) => Promise<EnqueueResult>,
+        channelOverride?: TextBasedChannel,
+    ): Promise<void> {
+        const channel = channelOverride ?? this.client.channels.cache.get(channelId) as TextBasedChannel
+        if (!channel) throw new Error(`channel ${channelId} is unavailable`);
         const messages = [...this.context.get(channelId)];
 
 
         if (messages.length == 1) {
 
-            messages.unshift({
+            const channelMessage: ChatMessage = {
                 role: "system",
                 content: XML.format("channel", { id: channel.id, type: channel.type, name: Object.hasOwn(channel, "name") ? (channel as GuildTextBasedChannel).name : undefined })
-            })
+            };
 
-            messages.unshift({
+            const recentMessage: ChatMessage = {
                 role: "user",
                 content: (await channel.messages.fetch())
                     .map(m =>
                         XML.format("recentMessage", { id: m.id, authorId: m.author.id, createdAt: AgentService.formatDate(m.createdAt) }, m.content)
                     ).join("\n")
-            })
+            };
+            if (signal.aborted) return;
+            messages.unshift(recentMessage, channelMessage);
+            this.context.prepend(channelId, recentMessage, channelMessage);
 
         }
 
@@ -350,35 +553,60 @@ export default class BotService extends AbstractService<"bot"> {
 
             if (signal.aborted) return;
 
-            const raw: any = { role: "assistant", content: response.content };
-            if (response.toolCalls?.length) {
-                raw.tool_calls = response.toolCalls.map(tc => ({
-                    id: tc.id,
-                    type: "function",
-                    function: { name: tc.name, arguments: tc.arguments },
-                }));
-            }
-            messages.push(raw);
+            const hasToolCalls = !!response.toolCalls?.length;
 
+            let assistantMsg: any = undefined;
+            if (hasToolCalls) {
+                assistantMsg = {
+                    role: "assistant",
+                    content: response.content,
+                    tool_calls: response.toolCalls!.map(tc => ({
+                        id: tc.id,
+                        type: "function",
+                        function: { name: tc.name, arguments: tc.arguments },
+                    })),
+                };
+                messages.push(assistantMsg);
+            }
+
+            let queuedMessages: ChatMessage[] = [];
             if (response.content) {
-                await enqueue(response.content);
+                const result = await enqueue(response.content);
+                queuedMessages = result.messages;
             }
 
-            if (!response.toolCalls?.length) break;
+            if (signal.aborted) return;
 
-            this.logger.log(`tool calls: ${response.toolCalls.map(tc => tc.name).join(", ")}`);
+            if (!assistantMsg) {
+                if (queuedMessages.length) {
+                    messages.push(...queuedMessages);
+                } else {
+                    const emptyMessage: ChatMessage = { role: "assistant", content: response.content ?? "" };
+                    messages.push(emptyMessage);
+                    this.context.append(channelId, emptyMessage);
+                }
+            }
 
-            for (const tc of response.toolCalls) {
+            if (!hasToolCalls) break;
+
+            this.logger.log(`tool calls: ${response.toolCalls!.map(tc => tc.name).join(", ")}`);
+
+            const toolMessages: ChatMessage[] = [];
+            for (const tc of response.toolCalls!) {
                 const result = await Core.services.tool.execute(tc.name, JSON.parse(tc.arguments), toolCtx);
-                messages.push({
+                if (signal.aborted) return;
+                const toolMessage: ChatMessage = {
                     role: "tool",
                     tool_call_id: tc.id,
                     content: result,
-                });
+                };
+                messages.push(toolMessage);
+                toolMessages.push(toolMessage);
             }
-        }
 
-        this.context.set(channelId, messages);
+            // Persist tool protocol messages only once every result is present.
+            this.context.append(channelId, { ...assistantMsg, content: null }, ...toolMessages);
+        }
     }
 
     private async shouldRespond(messages: Message[]): Promise<boolean> {
@@ -394,21 +622,27 @@ export default class BotService extends AbstractService<"bot"> {
         }
 
         const recentContent = messages.map(m =>
-            `[${m.author.displayName}]: ${m.content}`
+            `[${m.author.displayName}]: ${m.content}${m.attachments.some(attachment => attachment.contentType?.startsWith("image/") || attachment.width !== null) ? " [image attached]" : ""}`
         ).join("\n");
 
         const res = await Core.services.agent.chat([
             {
                 role: "system",
-                content: `you are a filtering agent. you decide if katie would chime in. her system prompt is provided below with some additional context. reply with just "yes" or "no". do not respond as katie.`,
+                content: Core.services.prompt.get("shouldRespond"),
             },
             {
                 role: "user",
-                content: `katie's system prompt: \n\n${Core.services.agent.getSystemPrompt()}`
+                content: Core.services.prompt.render("shouldRespondSystemPrompt", {
+                    systemPrompt: Core.services.agent.getSystemPrompt(),
+                }),
             },
             {
                 role: "user",
-                content: `channel info: ${channelCtx}\n\n${userContexts.join("\n\n")}\n\nrecent messages:\n${recentContent}`,
+                content: Core.services.prompt.render("shouldRespondContext", {
+                    channelContext: channelCtx,
+                    userContexts: userContexts.join("\n\n"),
+                    recentContent,
+                }),
             },
         ], { model: "qwen3-14b", temperature: 0.1, stripSystemPrompt: true });
 

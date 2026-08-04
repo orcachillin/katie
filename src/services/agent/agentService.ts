@@ -1,12 +1,28 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 import AbstractService from "../../base/abstractService.js";
+import Core from "../../core.js";
+
+const MAX_CONTEXT_IMAGES = 3;
+const IMAGE_ROOT = resolve("./workspace/images");
+
+export interface StoredImage {
+    id: string;
+    name: string;
+    path: string;
+    mimeType: string;
+    size: number;
+    width?: number;
+    height?: number;
+}
 
 export interface ChatMessage {
     role: "system" | "user" | "assistant" | "tool";
     content: string;
     name?: string;
     tool_call_id?: string;
+    images?: StoredImage[];
+    sent?: boolean;
 }
 
 export interface ToolDefinition {
@@ -64,23 +80,16 @@ export default class AgentService extends AbstractService<"agent"> {
     private apiKey: string;
     private apiUrl: string;
     private defaultModel: string;
-    private systemPrompt = "";
-
+    private visionModel: string;
     constructor() {
         super("agent");
         this.apiKey = process.env.AI_KEY!;
         this.apiUrl = (process.env.AI_URL || "https://api.neuralwatt.com/v1").replace(/\/+$/, "");
         this.defaultModel = process.env.AI_MODEL || "glm-5.2";
+        this.visionModel = process.env.AI_VISION_MODEL || this.defaultModel;
     }
 
     public async init(): Promise<void> {
-        try {
-            this.systemPrompt = readFileSync(resolve("./prompts/katie.md"), "utf-8");
-            this.logger.log("System prompt loaded");
-        } catch {
-            this.logger.warn("Could not load prompts/katie.md");
-        }
-
         if (!this.apiKey) {
             this.logger.warn("No AI_KEY set — agent will be disabled");
         }
@@ -89,17 +98,17 @@ export default class AgentService extends AbstractService<"agent"> {
     public async destroy(): Promise<void> { }
 
     async chat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResponse> {
-        const model = options?.model || this.defaultModel;
-        this.logger.log(`chat (${messages.length} msgs, ${model})`);
-
         const fullMessages: ChatMessage[] = options?.stripSystemPrompt ? messages : [
             { role: "system", content: this.getSystemPrompt() },
             ...messages,
         ];
+        const prepared = await this.prepareMessages(fullMessages);
+        const model = options?.model || (prepared.hasImages ? this.visionModel : this.defaultModel);
+        this.logger.log(`chat (${messages.length} msgs, ${model}${prepared.hasImages ? ", vision" : ""})`);
 
         const body: Record<string, unknown> = {
             model,
-            messages: fullMessages,
+            messages: prepared.messages,
             temperature: options?.temperature ?? 0.7,
             max_tokens: options?.maxTokens ?? 1024,
             provider: {
@@ -156,11 +165,61 @@ export default class AgentService extends AbstractService<"agent"> {
         };
     }
 
+    private async prepareMessages(messages: ChatMessage[]): Promise<{ messages: Record<string, unknown>[]; hasImages: boolean }> {
+        const selected = new Set<string>();
+        for (let messageIndex = messages.length - 1; messageIndex >= 0 && selected.size < MAX_CONTEXT_IMAGES; messageIndex--) {
+            const images = messages[messageIndex].images ?? [];
+            for (let imageIndex = images.length - 1; imageIndex >= 0 && selected.size < MAX_CONTEXT_IMAGES; imageIndex--) {
+                selected.add(images[imageIndex].path);
+            }
+        }
+
+        let hasImages = false;
+        const prepared = await Promise.all(messages.map(async message => {
+            const { images, sent, ...plainMessage } = message;
+            const messageContent = sent === false
+                ? `[sent: false]\n${message.content}`
+                : message.content;
+            const preparedMessage = { ...plainMessage, content: messageContent };
+            const selectedImages = images?.filter(image => selected.has(image.path)) ?? [];
+            if (selectedImages.length === 0) return preparedMessage;
+
+            const content: Record<string, unknown>[] = [
+                { type: "text", text: messageContent || "images attached" },
+            ];
+            for (const image of selectedImages) {
+                const absolutePath = resolve(image.path);
+                if (absolutePath !== IMAGE_ROOT && !absolutePath.startsWith(`${IMAGE_ROOT}${sep}`)) {
+                    this.logger.warn(`ignored image outside workspace: ${image.path}`);
+                    continue;
+                }
+                try {
+                    const data = await readFile(absolutePath);
+                    content.push({ type: "text", text: `image attachment: ${image.name}` });
+                    content.push({
+                        type: "image_url",
+                        image_url: {
+                            url: `data:${image.mimeType};base64,${data.toString("base64")}`,
+                            detail: "auto",
+                        },
+                    });
+                    hasImages = true;
+                } catch (err: any) {
+                    this.logger.warn(`could not load stored image ${image.id}: ${err?.message ?? err}`);
+                }
+            }
+
+            return content.length > 1 ? { ...preparedMessage, content } : preparedMessage;
+        }));
+
+        return { messages: prepared, hasImages };
+    }
+
     public getSystemPrompt(): string {
         const now = new Date();
         const dateStr = AgentService.formatDate(now)
 
-        return `${this.systemPrompt}\n\nCurrent date and time: ${dateStr}`;
+        return `${Core.services.prompt.get("katie")}\n\n${Core.services.prompt.render("currentDate", { date: dateStr })}`;
     }
 
     public static formatDate(date: Date) {
