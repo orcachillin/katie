@@ -1,0 +1,1 @@
+your response contained content but no valid `<message>...</message>`, `<react .../>`, or `<noResponse/>` elements, so nothing could be sent. try again and format the entire response using the required message xml. use `<noResponse/>` by itself when intentionally sending nothing.

@@ -32,13 +32,13 @@ export const DatabaseConfig: Parameters<typeof defineConfig<PostgreSqlDriver, En
     },
     driver: PostgreSqlDriver,
     metadataProvider,
-    metadataCache: {
-        enabled: true,
-        ...DEVELOPMENT ? undefined : {
+    metadataCache: DEVELOPMENT
+        ? { enabled: false }
+        : {
+            enabled: true,
             adapter: GeneratedCacheAdapter,
-            options: { data }
+            options: { data },
         },
-    },
     preferTs: true,
     verbose: true,
     user: process.env.DB_USER || "postgres",

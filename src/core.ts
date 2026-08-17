@@ -13,6 +13,7 @@ import SettingsService from "./services/settings/settingsService.js";
 import SchedulerService from "./services/scheduler/schedulerService.js";
 import SSEService from "./services/sse/sseService.js";
 import ToolService from "./services/tool/toolService.js";
+import VoiceService from "./services/voice/voiceService.js";
 import WebService from "./services/web/webService.js";
 import { Logger } from "./util/logger.js";
 
@@ -40,6 +41,7 @@ export default class Core {
         new SchedulerService(),
         new IncentiveService(),
         new BotService(),
+        new VoiceService(),
         new WebService(),
         new ContextService(),
         new SSEService(),

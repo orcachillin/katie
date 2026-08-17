@@ -38,11 +38,13 @@
     "vite": "^8.0.16"
   },
   "dependencies": {
+    "@discordjs/voice": "^0.19.2",
     "@kitajs/html": "^4.2.13",
     "@mikro-orm/core": "^7.1.4",
     "@mikro-orm/decorators": "^7.1.4",
     "@mikro-orm/migrations": "^7.1.4",
     "@mikro-orm/postgresql": "^7.1.4",
+    "@noble/ciphers": "^2.3.0",
     "@paralleldrive/cuid2": "^3.3.0",
     "bootstrap": "^5.3.8",
     "chalk": "^5.6.2",
@@ -52,6 +54,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "openai": "^6.45.0",
+    "opusscript": "^0.0.8",
     "redis": "^6.1.0"
   }
 }

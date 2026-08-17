@@ -10,6 +10,15 @@ import type { ToolContext } from "../tool/toolService.js";
 import XML from "../../util/xml.js";
 import AgentService from "../agent/agentService.js";
 
+const MAX_MESSAGE_FORMAT_RETRIES = 2;
+const DEFAULT_IDLE_TIMEOUT = 15 * 60 * 1000;
+const DEFAULT_ONLINE_INTERVAL = 2 * 60 * 60 * 1000;
+const DEFAULT_ONLINE_WINDOW = 15 * 60 * 1000;
+const DEFAULT_WAKE_DELAY_MIN = 5000;
+const DEFAULT_WAKE_DELAY_MAX = 12000;
+
+type BotPresenceStatus = "online" | "idle";
+
 interface PendingBatch {
     messages: Message[];
 }
@@ -30,6 +39,26 @@ export interface IncentiveInput {
     username: string;
     messageId: string;
     lastMessageAt: Date;
+}
+
+export interface VoiceTranscriptInput {
+    channelId: string;
+    userId: string;
+    username: string;
+    messageId: string;
+    transcript: string;
+}
+
+export interface VoiceCallStartedInput {
+    channelId: string;
+    userId: string;
+    direction: "incoming" | "outgoing";
+    startedAt: Date;
+}
+
+export interface VoiceCallEventInput extends SyntheticPromptInput {
+    event: "incomingCall" | "participantJoined" | "participantLeft";
+    occurredAt: Date;
 }
 
 interface SyntheticPromptInput {
@@ -62,12 +91,14 @@ interface MessageOptions {
 interface EnqueueResult {
     delivered: boolean;
     messages: ChatMessage[];
+    needsRetry: boolean;
 }
 
 interface ParsedMessage {
     text: string;
     opts: MessageOptions;
     raw: string;
+    noResponse?: boolean;
 }
 
 export default class BotService extends AbstractService<"bot"> {
@@ -76,6 +107,20 @@ export default class BotService extends AbstractService<"bot"> {
     private activeRuns = new Map<string, AbortController>();
     private context = new ChannelContext();
     private queues = new Map<string, ChannelQueue>();
+    private presenceActive = false;
+    private presenceStatus?: BotPresenceStatus;
+    private lastHumanActivityAt = Date.now();
+    private forcedOnlineUntil = 0;
+    private presenceTimer?: NodeJS.Timeout;
+    private periodicOnlineTimer?: NodeJS.Timeout;
+    private readonly idleTimeout = this.readNumber("PRESENCE_IDLE_TIMEOUT_MS", DEFAULT_IDLE_TIMEOUT, 1000);
+    private readonly onlineInterval = this.readNumber("PRESENCE_ONLINE_INTERVAL_MS", DEFAULT_ONLINE_INTERVAL, 60_000);
+    private readonly onlineWindow = this.readNumber("PRESENCE_ONLINE_WINDOW_MS", DEFAULT_ONLINE_WINDOW, 1000);
+    private readonly incentiveOnlineWindow = this.readNumber("PRESENCE_INCENTIVE_WINDOW_MS", DEFAULT_ONLINE_WINDOW, 1000);
+    private readonly dayStartHour = this.readNumber("PRESENCE_DAY_START_HOUR", 8, 0, 23);
+    private readonly dayEndHour = this.readNumber("PRESENCE_DAY_END_HOUR", 2, 0, 23);
+    private readonly wakeDelayMin = this.readNumber("PRESENCE_WAKE_DELAY_MIN_MS", DEFAULT_WAKE_DELAY_MIN, 0);
+    private readonly wakeDelayMax = Math.max(this.wakeDelayMin, this.readNumber("PRESENCE_WAKE_DELAY_MAX_MS", DEFAULT_WAKE_DELAY_MAX, 0));
 
     constructor() {
         super("bot");
@@ -92,6 +137,7 @@ export default class BotService extends AbstractService<"bot"> {
         this.client.on("error", (err) => this.logger.error(err));
 
         await this.client.login(process.env.TOKEN);
+        this.startPresenceManagement();
     }
 
     public getClient(): Client {
@@ -100,6 +146,79 @@ export default class BotService extends AbstractService<"bot"> {
 
     public getContexts(): Record<string, ChatMessage[]> {
         return this.context.all();
+    }
+
+    private startPresenceManagement(): void {
+        this.presenceActive = true;
+        this.lastHumanActivityAt = Date.now();
+        this.updatePresence();
+        this.schedulePeriodicOnlineWindow();
+    }
+
+    private recordHumanActivity(): boolean {
+        const wokeFromIdle = this.presenceStatus === "idle";
+        this.lastHumanActivityAt = Date.now();
+        this.updatePresence();
+        return wokeFromIdle;
+    }
+
+    private keepOnlineFor(duration: number): void {
+        this.forcedOnlineUntil = Math.max(this.forcedOnlineUntil, Date.now() + duration);
+        this.updatePresence();
+    }
+
+    private updatePresence(): void {
+        if (!this.presenceActive) return;
+        if (this.presenceTimer) clearTimeout(this.presenceTimer);
+
+        const onlineUntil = Math.max(this.lastHumanActivityAt + this.idleTimeout, this.forcedOnlineUntil);
+        const remaining = onlineUntil - Date.now();
+        if (remaining > 0) {
+            this.setPresenceStatus("online");
+            this.presenceTimer = setTimeout(() => this.updatePresence(), remaining);
+        } else {
+            this.presenceTimer = undefined;
+            this.setPresenceStatus("idle");
+        }
+    }
+
+    private setPresenceStatus(status: BotPresenceStatus): void {
+        if (this.presenceStatus === status) return;
+        try {
+            this.client.user?.setStatus(status);
+            this.presenceStatus = status;
+            this.logger.log(`presence set to ${status}`);
+        } catch (err: any) {
+            this.logger.warn(`failed to set presence to ${status}: ${err?.message ?? err}`);
+        }
+    }
+
+    private schedulePeriodicOnlineWindow(): void {
+        if (!this.presenceActive) return;
+        const delay = this.onlineInterval * (0.75 + Math.random() * 0.5);
+        this.periodicOnlineTimer = setTimeout(() => {
+            if (!this.presenceActive) return;
+            if (this.isDaytime()) this.keepOnlineFor(this.onlineWindow);
+            this.schedulePeriodicOnlineWindow();
+        }, delay);
+    }
+
+    private isDaytime(date = new Date()): boolean {
+        const hour = date.getHours();
+        if (this.dayStartHour === this.dayEndHour) return true;
+        if (this.dayStartHour < this.dayEndHour) {
+            return hour >= this.dayStartHour && hour < this.dayEndHour;
+        }
+        return hour >= this.dayStartHour || hour < this.dayEndHour;
+    }
+
+    private randomWakeDelay(): number {
+        return this.wakeDelayMin + Math.random() * (this.wakeDelayMax - this.wakeDelayMin);
+    }
+
+    private readNumber(name: string, fallback: number, min: number, max = Number.POSITIVE_INFINITY): number {
+        const value = Number(process.env[name]);
+        return Number.isFinite(value) && value >= min && value <= max ? value : fallback;
     }
 
     public async processScheduledPrompt(input: ScheduledPromptInput): Promise<boolean> {
@@ -115,11 +234,48 @@ export default class BotService extends AbstractService<"bot"> {
     }
 
     public async processIncentive(input: IncentiveInput): Promise<boolean> {
+        if (this.activeRuns.has(input.channelId)) return false;
+        this.keepOnlineFor(this.incentiveOnlineWindow);
         return this.processSyntheticPrompt(input, {
             role: "user",
             content: XML.format("incentive", {
                 lastMessageAt: input.lastMessageAt.toISOString(),
+                currentTime: AgentService.formatDate(new Date())
             }, Core.services.prompt.get("incentive")),
+        });
+    }
+
+    public async processVoiceTranscript(input: VoiceTranscriptInput): Promise<boolean> {
+        return this.processSyntheticPrompt(input, {
+            role: "user",
+            content: XML.format("voiceMessage", {
+                id: input.messageId,
+                from: input.userId,
+                transcribed: "true",
+            }, input.transcript),
+        });
+    }
+
+    public recordVoiceCallStarted(input: VoiceCallStartedInput): void {
+        this.context.append(input.channelId, {
+            role: "system",
+            content: XML.format("voiceCallStarted", {
+                direction: input.direction,
+                userId: input.userId,
+                startedAt: input.startedAt.toISOString(),
+            }),
+        });
+    }
+
+    public async processVoiceCallEvent(input: VoiceCallEventInput): Promise<boolean> {
+        return this.processSyntheticPrompt(input, {
+            role: "system",
+            content: XML.format("voiceCallEvent", {
+                type: input.event,
+                userId: input.userId,
+                username: input.username,
+                occurredAt: input.occurredAt.toISOString(),
+            }),
         });
     }
 
@@ -148,7 +304,7 @@ export default class BotService extends AbstractService<"bot"> {
             await this.run(input.channelId, toolCtx, controller.signal, async (text) => {
                 const result = await this.enqueueMessages(input.channelId, channel as Message["channel"], text, input.messageId, controller.signal);
                 delivered = result.delivered;
-                if (!delivered && !controller.signal.aborted) {
+                if (!delivered && !result.needsRetry && !controller.signal.aborted) {
                     throw new Error("synthetic prompt response could not be sent");
                 }
                 return result;
@@ -169,6 +325,9 @@ export default class BotService extends AbstractService<"bot"> {
     }
 
     public async destroy(): Promise<void> {
+        this.presenceActive = false;
+        if (this.presenceTimer) clearTimeout(this.presenceTimer);
+        if (this.periodicOnlineTimer) clearTimeout(this.periodicOnlineTimer);
         this.client.destroy();
     }
 
@@ -234,6 +393,7 @@ export default class BotService extends AbstractService<"bot"> {
         }
 
         if (signal.aborted) return;
+        const wokeFromIdle = this.recordHumanActivity();
 
         void Core.services.incentive.recordActivity({
             channelId,
@@ -270,7 +430,7 @@ export default class BotService extends AbstractService<"bot"> {
             content: batch.messages.map((m, index) =>
                 XML.format(
                     "message",
-                    { from: m.author.id, id: m.id, replyTo: m.type == "REPLY" ? m.reference?.messageId : undefined, timestamp: m.createdTimestamp.toString() },
+                    { from: m.author.id, id: m.id, replyTo: m.type == "REPLY" ? m.reference?.messageId : undefined, timestamp: m.createdTimestamp.toString(), sentAt: AgentService.formatDate(m.createdAt) },
                     [m.content, storedImages[index].context].filter(Boolean).join("\n"),
                 )
             ).join("\n"),
@@ -286,8 +446,11 @@ export default class BotService extends AbstractService<"bot"> {
         };
 
         try {
+            let initialResponseDelayMs = wokeFromIdle ? this.randomWakeDelay() : 0;
             await this.run(channelId, toolCtx, signal, async (text) => {
-                return this.enqueueMessages(channelId, channel, text, latest.id, signal);
+                const result = await this.enqueueMessages(channelId, channel, text, latest.id, signal, initialResponseDelayMs);
+                if (!result.needsRetry) initialResponseDelayMs = 0;
+                return result;
             });
         } catch (err: any) {
             if (err?.name === "AbortError") return;
@@ -301,12 +464,13 @@ export default class BotService extends AbstractService<"bot"> {
         text: string,
         defaultReplyTo: string,
         signal: AbortSignal,
+        initialDelayMs = 0,
     ): Promise<EnqueueResult> {
-        if (signal.aborted) return Promise.resolve({ delivered: false, messages: [] });
+        if (signal.aborted) return Promise.resolve({ delivered: false, messages: [], needsRetry: false });
 
-        const q = this.getQueue(channelId);
         let parsedMessages = this.parseXMLMessages(text);
-        let accumulatedDelay = 0;
+        let accumulatedDelay = initialDelayMs;
+        let hasScheduledOutput = false;
         const sendPromises: Promise<boolean>[] = [];
         const contextMessages: ChatMessage[] = [];
 
@@ -316,16 +480,25 @@ export default class BotService extends AbstractService<"bot"> {
             parsedMessages = this.parseXMLMessages(`<${text}`)
         }
 
-        // try to cover for non formatted messages
-        if (parsedMessages.length == 0) {
-
-            parsedMessages.push({
-                text,
-                opts: {},
-                raw: text,
-            });
+        if (text.trim() && parsedMessages.length === 0) {
+            this.logger.warn("agent response contained content but no valid messages; requesting a retry");
+            return Promise.resolve({ delivered: false, messages: [], needsRetry: true });
         }
 
+        const noResponse = parsedMessages.find(parsed => parsed.noResponse);
+        if (noResponse) {
+            if (parsedMessages.length > 1) {
+                this.logger.warn("agent response mixed noResponse with message output; requesting a retry");
+                return Promise.resolve({ delivered: false, messages: [], needsRetry: true });
+            }
+
+            const contextMessage: ChatMessage = { role: "assistant", content: noResponse.raw };
+            this.context.append(channelId, contextMessage);
+            this.logger.log("agent chose not to respond");
+            return Promise.resolve({ delivered: true, messages: [contextMessage], needsRetry: false });
+        }
+
+        const q = this.getQueue(channelId);
 
         for (const parsed of parsedMessages) {
             let content = parsed.text;
@@ -341,10 +514,12 @@ export default class BotService extends AbstractService<"bot"> {
             if (!content && !reactions?.length) continue;
 
             const wordCount = content.split(/\s+/).filter(Boolean).length;
-            const readDelay = Math.random() * 8000
-            const messageDelay = opts.delayTime ?? Math.max(1000, wordCount * 900) + readDelay
+            const readingDelay = hasScheduledOutput ? 0 : 1000 + Math.random() * 4000;
+            const messageDelay = opts.delayTime ?? Math.max(1000, wordCount * 900) + readingDelay;
+            const typingStartDelay = accumulatedDelay + Math.min(readingDelay, Math.max(0, messageDelay - 500));
 
             accumulatedDelay += messageDelay;
+            hasScheduledOutput = true;
             const sendAt = Date.now() + accumulatedDelay;
 
             this.logger.info(`[${accumulatedDelay}ms] sending... ${content}`)
@@ -380,18 +555,22 @@ export default class BotService extends AbstractService<"bot"> {
             };
             q.pending.push(queued);
 
-            // Send typing immediately, then refresh every 10s until the message sends
-            const sendTyping = async () => {
+            let typingInterval: NodeJS.Timeout | undefined;
+            const sendTyping = () => {
                 if (signal.aborted || this.queues.get(channelId) !== q) return;
-                try { await channel.sendTyping(); } catch { }
+                void channel.sendTyping().catch(() => { });
             };
-            sendTyping();
-            const typingInterval = setInterval(sendTyping, 10000);
-            q.timeouts.push(typingInterval);
+            const typingTimeout = content ? setTimeout(() => {
+                sendTyping();
+                typingInterval = setInterval(sendTyping, 10000);
+                q.timeouts.push(typingInterval);
+            }, typingStartDelay) : undefined;
+            if (typingTimeout) q.timeouts.push(typingTimeout);
 
             const sendPromise = new Promise<boolean>((resolve) => {
                 const sendTimeout = setTimeout(async () => {
-                    clearInterval(typingInterval);
+                    if (typingTimeout) clearTimeout(typingTimeout);
+                    if (typingInterval) clearInterval(typingInterval);
                     const idx = q.pending.indexOf(queued);
                     if (idx !== -1) q.pending.splice(idx, 1);
                     if (signal.aborted || this.queues.get(channelId) !== q) { resolve(false); return; }
@@ -453,15 +632,15 @@ export default class BotService extends AbstractService<"bot"> {
 
         return Promise.all(sendPromises).then(results => {
             const delivered = results.every(Boolean);
-            return { delivered, messages: contextMessages };
+            return { delivered, messages: contextMessages, needsRetry: false };
         });
     }
 
     private parseXMLMessages(raw: string): ParsedMessage[] {
         const results: ParsedMessage[] = [];
 
-        // Match <message ...>...</message> or standalone <react .../>
-        const regex = /<message\b([^>]*)>([\s\S]*?)<\/message>|<react\b([^>]*)\/>/g;
+        // Match <message ...>...</message>, <react .../>, or <noResponse/>.
+        const regex = /<message\b([^>]*)>([\s\S]*?)<\/message>|<react\b([^>]*)\/>|<noResponse\s*\/>/g;
         let match: RegExpExecArray | null;
 
         while ((match = regex.exec(raw)) !== null) {
@@ -491,6 +670,8 @@ export default class BotService extends AbstractService<"bot"> {
                     opts: { react: `${attrs.emoji}:${attrs.target}` },
                     raw: match[0],
                 });
+            } else {
+                results.push({ text: "", opts: {}, raw: match[0], noResponse: true });
             }
         }
 
@@ -540,6 +721,7 @@ export default class BotService extends AbstractService<"bot"> {
         }
 
         let loop = 0;
+        let messageFormatRetries = 0;
 
         while (true) {
             if (signal.aborted) return;
@@ -570,12 +752,18 @@ export default class BotService extends AbstractService<"bot"> {
             }
 
             let queuedMessages: ChatMessage[] = [];
+            let needsRetry = false;
             if (response.content) {
                 const result = await enqueue(response.content);
                 queuedMessages = result.messages;
+                needsRetry = result.needsRetry;
             }
 
             if (signal.aborted) return;
+            if (needsRetry && ++messageFormatRetries > MAX_MESSAGE_FORMAT_RETRIES) {
+                this.logger.warn(`agent failed to produce valid message XML after ${MAX_MESSAGE_FORMAT_RETRIES} retries`);
+                return;
+            }
 
             if (!assistantMsg) {
                 if (queuedMessages.length) {
@@ -583,11 +771,17 @@ export default class BotService extends AbstractService<"bot"> {
                 } else {
                     const emptyMessage: ChatMessage = { role: "assistant", content: response.content ?? "" };
                     messages.push(emptyMessage);
-                    this.context.append(channelId, emptyMessage);
+                    if (!needsRetry) this.context.append(channelId, emptyMessage);
                 }
             }
 
-            if (!hasToolCalls) break;
+            if (!hasToolCalls) {
+                if (needsRetry) {
+                    messages.push({ role: "user", content: Core.services.prompt.get("retryMessageFormat") });
+                    continue;
+                }
+                break;
+            }
 
             this.logger.log(`tool calls: ${response.toolCalls!.map(tc => tc.name).join(", ")}`);
 
@@ -606,6 +800,9 @@ export default class BotService extends AbstractService<"bot"> {
 
             // Persist tool protocol messages only once every result is present.
             this.context.append(channelId, { ...assistantMsg, content: null }, ...toolMessages);
+            if (needsRetry) {
+                messages.push({ role: "user", content: Core.services.prompt.get("retryMessageFormat") });
+            }
         }
     }
 
