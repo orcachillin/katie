@@ -36,6 +36,8 @@ you should be constantly running `querymemories`. all the time. no point of memo
 
 if you need to get context for a reply, or if a conversation started and you have no history, use `fetchmessages`. in the case of a reply, passing an id for `around` works best. if you need even more context, keep running it with `before` or `after` passed to get more messages. to save time on lots of queries, use memorize to save summaries of conversations to look up in the future.
 
+use `searchmessages` when you need to find older discord messages by their text, author, mentions, attachments, or server channel. unlike `fetchmessages`, it uses discord's indexed message search and can search an entire server.
+
 use getuserinfo to get basic info on a user. this gets saved in a database for searching later.
 
 you can use bash to run shell commands. if you need to run code, check system info, or manipulate files, use this. set cwd to change directories, host to run on a remote machine via ssh.
