@@ -51,7 +51,9 @@ export interface VoiceTranscriptInput {
 
 export interface VoiceCallStartedInput {
     channelId: string;
-    userId: string;
+    userId?: string;
+    participantIds?: string[];
+    channelType: "DM" | "GROUP_DM";
     direction: "incoming" | "outgoing";
     startedAt: Date;
 }
@@ -105,7 +107,19 @@ export default class BotService extends AbstractService<"bot"> {
 
     private client!: Client;
     private activeRuns = new Map<string, AbortController>();
-    private context = new ChannelContext();
+    private context = new ChannelContext(async (messages, previousSummary) => {
+        const response = await Core.services.agent.chat([
+            { role: "system", content: Core.services.prompt.get("condense") },
+            {
+                role: "user",
+                content: [
+                    previousSummary ? XML.format("previousSummary", {}, previousSummary) : "",
+                    ...messages.map(message => `${message.role}: ${String(message.content ?? "")}`),
+                ].filter(Boolean).join("\n"),
+            },
+        ], { model: "qwen3-14b", temperature: 0.2, stripSystemPrompt: true });
+        return response.content ?? "";
+    });
     private queues = new Map<string, ChannelQueue>();
     private presenceActive = false;
     private presenceStatus?: BotPresenceStatus;
@@ -146,6 +160,10 @@ export default class BotService extends AbstractService<"bot"> {
 
     public getContexts(): Record<string, ChatMessage[]> {
         return this.context.all();
+    }
+
+    public getChannelContext(): ChannelContext {
+        return this.context;
     }
 
     private startPresenceManagement(): void {
@@ -251,9 +269,10 @@ export default class BotService extends AbstractService<"bot"> {
             content: XML.format("voiceMessage", {
                 id: input.messageId,
                 from: input.userId,
+                username: input.username,
                 transcribed: "true",
             }, input.transcript),
-        });
+        }, 0.5);
     }
 
     public recordVoiceCallStarted(input: VoiceCallStartedInput): void {
@@ -262,6 +281,8 @@ export default class BotService extends AbstractService<"bot"> {
             content: XML.format("voiceCallStarted", {
                 direction: input.direction,
                 userId: input.userId,
+                participantIds: input.participantIds?.join(","),
+                channelType: input.channelType,
                 startedAt: input.startedAt.toISOString(),
             }),
         });
@@ -279,7 +300,11 @@ export default class BotService extends AbstractService<"bot"> {
         });
     }
 
-    private async processSyntheticPrompt(input: SyntheticPromptInput, syntheticMessage: ChatMessage): Promise<boolean> {
+    private async processSyntheticPrompt(
+        input: SyntheticPromptInput,
+        syntheticMessage: ChatMessage,
+        responseDelayMultiplier = 1,
+    ): Promise<boolean> {
         if (this.activeRuns.has(input.channelId)) return false;
 
         const controller = new AbortController();
@@ -302,7 +327,15 @@ export default class BotService extends AbstractService<"bot"> {
 
             let delivered = false;
             await this.run(input.channelId, toolCtx, controller.signal, async (text) => {
-                const result = await this.enqueueMessages(input.channelId, channel as Message["channel"], text, input.messageId, controller.signal);
+                const result = await this.enqueueMessages(
+                    input.channelId,
+                    channel as Message["channel"],
+                    text,
+                    input.messageId,
+                    controller.signal,
+                    0,
+                    responseDelayMultiplier,
+                );
                 delivered = result.delivered;
                 if (!delivered && !result.needsRetry && !controller.signal.aborted) {
                     throw new Error("synthetic prompt response could not be sent");
@@ -465,6 +498,7 @@ export default class BotService extends AbstractService<"bot"> {
         defaultReplyTo: string,
         signal: AbortSignal,
         initialDelayMs = 0,
+        delayMultiplier = 1,
     ): Promise<EnqueueResult> {
         if (signal.aborted) return Promise.resolve({ delivered: false, messages: [], needsRetry: false });
 
@@ -514,8 +548,9 @@ export default class BotService extends AbstractService<"bot"> {
             if (!content && !reactions?.length) continue;
 
             const wordCount = content.split(/\s+/).filter(Boolean).length;
-            const readingDelay = hasScheduledOutput ? 0 : 1000 + Math.random() * 4000;
-            const messageDelay = opts.delayTime ?? Math.max(1000, wordCount * 900) + readingDelay;
+            const baseReadingDelay = hasScheduledOutput ? 0 : 1000 + Math.random() * 4000;
+            const readingDelay = baseReadingDelay * delayMultiplier;
+            const messageDelay = (opts.delayTime ?? Math.max(1000, wordCount * 900) + baseReadingDelay) * delayMultiplier;
             const typingStartDelay = accumulatedDelay + Math.min(readingDelay, Math.max(0, messageDelay - 500));
 
             accumulatedDelay += messageDelay;

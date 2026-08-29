@@ -1,4 +1,5 @@
 import BaseAIClient from "./baseAIClient.js";
+import { estimateContextTokens } from "../tokenEstimator.js";
 import type { ChatMessage, ChatOptions, ChatResponse, PreparedMessages, StreamChunk } from "../types.js";
 
 export default class ChatClient extends BaseAIClient {
@@ -21,13 +22,13 @@ export default class ChatClient extends BaseAIClient {
         ];
         const prepared = await this.prepareMessages(fullMessages);
         const model = options?.model || (prepared.hasImages ? this.visionModel : this.defaultModel);
-        this.logger.log(`chat (${messages.length} msgs, ${model}${prepared.hasImages ? ", vision" : ""})`);
+        this.logger.log(`chat (${messages.length} msgs, ~${estimateContextTokens(fullMessages)} tokens, ${model}${prepared.hasImages ? ", vision" : ""})`);
 
         const body: Record<string, unknown> = {
             model,
             messages: prepared.messages,
             temperature: options?.temperature ?? 0.7,
-            max_tokens: options?.maxTokens ?? 1024,
+            ...(options?.maxTokens ? { max_tokens: options.maxTokens } : {}),
             provider: { ignore: ["Inceptron", "Morph"] },
         };
         if (options?.tools?.length) {
@@ -74,7 +75,7 @@ export default class ChatClient extends BaseAIClient {
                 ...messages,
             ],
             temperature: options?.temperature ?? 0.7,
-            max_tokens: options?.maxTokens ?? 1024,
+            ...(options?.maxTokens ? { max_tokens: options.maxTokens } : {}),
             stream: true,
         };
         if (options?.tools?.length) {

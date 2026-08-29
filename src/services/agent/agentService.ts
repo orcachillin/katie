@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import AbstractService from "../../base/abstractService.js";
 import Core from "../../core.js";
+import { selectRecentImages } from "./imageSelection.js";
+import { trimOldToolResults } from "./tokenEstimator.js";
 import ChatClient from "./clients/chatClient.js";
 import TranscriptionClient from "./clients/transcriptionClient.js";
 import type { ChatMessage, ChatOptions, ChatResponse, PreparedMessages, StreamChunk } from "./types.js";
@@ -9,6 +11,8 @@ import type { ChatMessage, ChatOptions, ChatResponse, PreparedMessages, StreamCh
 export type { ChatMessage, ChatOptions, ChatResponse, StoredImage, StreamChunk, ToolCall, ToolDefinition } from "./types.js";
 
 const MAX_CONTEXT_IMAGES = 3;
+const DEFAULT_IMAGE_MAX_AGE_MS = 30 * 60 * 1000;
+const IMAGE_MAX_AGE_MS = Math.max(0, Number(process.env.IMAGE_MAX_AGE_MS) || DEFAULT_IMAGE_MAX_AGE_MS);
 const IMAGE_ROOT = resolve("./workspace/images");
 
 export default class AgentService extends AbstractService<"agent"> {
@@ -53,13 +57,7 @@ export default class AgentService extends AbstractService<"agent"> {
     }
 
     private async prepareMessages(messages: ChatMessage[]): Promise<PreparedMessages> {
-        const selected = new Set<string>();
-        for (let messageIndex = messages.length - 1; messageIndex >= 0 && selected.size < MAX_CONTEXT_IMAGES; messageIndex--) {
-            const images = messages[messageIndex].images ?? [];
-            for (let imageIndex = images.length - 1; imageIndex >= 0 && selected.size < MAX_CONTEXT_IMAGES; imageIndex--) {
-                selected.add(images[imageIndex].path);
-            }
-        }
+        const selection = await selectRecentImages(messages, MAX_CONTEXT_IMAGES, IMAGE_MAX_AGE_MS);
 
         let hasImages = false;
         const prepared = await Promise.all(messages.map(async message => {
@@ -68,16 +66,20 @@ export default class AgentService extends AbstractService<"agent"> {
                 ? `[sent: false]\n${message.content}`
                 : message.content;
             const preparedMessage = { ...plainMessage, content: messageContent };
-            const selectedImages = images?.filter(image => selected.has(image.path)) ?? [];
-            if (selectedImages.length === 0) return preparedMessage;
+            if (!images?.length) return preparedMessage;
 
             const content: Record<string, unknown>[] = [
                 { type: "text", text: messageContent || "images attached" },
             ];
-            for (const image of selectedImages) {
+            for (const image of images) {
+                if (!selection.selected.has(image.path)) {
+                    content.push({ type: "text", text: `[image attachment: ${image.name} — evicted]` });
+                    continue;
+                }
                 const absolutePath = resolve(image.path);
                 if (absolutePath !== IMAGE_ROOT && !absolutePath.startsWith(`${IMAGE_ROOT}${sep}`)) {
                     this.logger.warn(`ignored image outside workspace: ${image.path}`);
+                    content.push({ type: "text", text: `[image attachment: ${image.name} — evicted]` });
                     continue;
                 }
                 try {
@@ -93,11 +95,14 @@ export default class AgentService extends AbstractService<"agent"> {
                     hasImages = true;
                 } catch (err: any) {
                     this.logger.warn(`could not load stored image ${image.id}: ${err?.message ?? err}`);
+                    content.push({ type: "text", text: `[image attachment: ${image.name} — evicted]` });
                 }
             }
 
-            return content.length > 1 ? { ...preparedMessage, content } : preparedMessage;
+            return { ...preparedMessage, content };
         }));
+
+        trimOldToolResults(prepared as ChatMessage[]);
 
         return { messages: prepared, hasImages };
     }

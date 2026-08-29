@@ -8,32 +8,35 @@ import {
     type VoiceConnection,
     type VoiceWebSocket,
 } from "@discordjs/voice";
-import type { CallState, DMChannel, User } from "discord.js-selfbot-v13";
+import type { CallState, DMChannel, GroupDMChannel } from "discord.js-selfbot-v13";
 import OpusScript from "opusscript";
 import AbstractService from "../../base/abstractService.js";
 import Core from "../../core.js";
 import Id from "../../util/id.js";
 
 const CONNECTION_TIMEOUT = 20_000;
-const DEFAULT_CALL_DURATION = 60_000;
 const DEFAULT_INCOMING_DELAY_MIN = 2_500;
 const DEFAULT_INCOMING_DELAY_MAX = 7_000;
-const DEFAULT_INCOMING_MAX_DURATION = 30 * 60 * 1000;
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 3_000;
 const DEFAULT_UTTERANCE_SILENCE_MS = 250;
+const DEFAULT_EMPTY_CALL_GRACE_MS = 1_000;
 const MIN_UTTERANCE_PACKETS = 10;
 const MIN_SPEECH_PEAK = 500;
 const MIN_SPEECH_RMS = 100;
 
+type PrivateCallChannel = DMChannel | GroupDMChannel;
+
 interface ActiveCall {
+    capturing: Set<string>;
     channelId: string;
     connection: VoiceConnection;
+    emptyCallTimeout?: NodeJS.Timeout;
     packetsReceived: number;
     participants: Set<string>;
     processingQueue: Promise<void>;
     startedAt: number;
-    targetUserId: string;
-    username: string;
+    label: string;
+    usernames: Map<string, string>;
     timeout?: NodeJS.Timeout;
     onSpeaking: (userId: string) => void;
     onVoicePacket?: (packet: any) => void;
@@ -55,11 +58,7 @@ export default class VoiceService extends AbstractService<"voice"> {
         this.incomingDelayMin,
         this.readNumber("INCOMING_CALL_DELAY_MAX_MS", DEFAULT_INCOMING_DELAY_MAX, 0),
     );
-    private readonly incomingMaxDuration = this.readNumber(
-        "INCOMING_CALL_MAX_DURATION_MS",
-        DEFAULT_INCOMING_MAX_DURATION,
-        10_000,
-    );
+
     private readonly transcriptionChunkMs = this.readNumber(
         "VOICE_TRANSCRIPTION_CHUNK_MS",
         DEFAULT_TRANSCRIPTION_CHUNK_MS,
@@ -71,6 +70,12 @@ export default class VoiceService extends AbstractService<"voice"> {
         DEFAULT_UTTERANCE_SILENCE_MS,
         100,
         2_000,
+    );
+    private readonly emptyCallGraceMs = this.readNumber(
+        "VOICE_EMPTY_CALL_GRACE_MS",
+        DEFAULT_EMPTY_CALL_GRACE_MS,
+        0,
+        30_000,
     );
     private readonly onCallCreate = (call: CallState) => this.handleCallState(call);
     private readonly onCallUpdate = (call: CallState) => this.handleCallState(call);
@@ -87,9 +92,9 @@ export default class VoiceService extends AbstractService<"voice"> {
         client.on("callDelete", this.onCallDelete);
     }
 
-    public async startCall(userId: string, duration = DEFAULT_CALL_DURATION): Promise<string> {
+    public async startCall(userId: string): Promise<string> {
         if (this.activeCall) {
-            return `already in a call with user ${this.activeCall.targetUserId}`;
+            return `already in a call with ${this.activeCall.label}`;
         }
 
         const client = Core.services.bot.getClient();
@@ -97,7 +102,40 @@ export default class VoiceService extends AbstractService<"voice"> {
 
         const user = await client.users.fetch(userId);
         const channel = await user.createDM();
-        return this.connectCall(user, channel, duration, true);
+        return this.connectCall(
+            channel,
+            "outgoing",
+            new Map([[user.id, user.username]]),
+            [],
+            () => channel.ring(),
+        );
+    }
+
+    public async startGroupCall(channelId: string, recipientIds?: string[]): Promise<string> {
+        if (this.activeCall) return `already in a call with ${this.activeCall.label}`;
+
+        const client = Core.services.bot.getClient();
+        const channel = await client.channels.fetch(channelId);
+        if (!channel || channel.type !== "GROUP_DM") return "channel is not an accessible Group DM";
+
+        const selfId = client.user?.id;
+        const users = new Map(
+            [...channel.recipients.values()]
+                .filter(user => user.id !== selfId)
+                .map(user => [user.id, user.username]),
+        );
+        const ringingIds = recipientIds?.length ? [...new Set(recipientIds)] : [...users.keys()];
+        const invalidId = ringingIds.find(id => !users.has(id));
+        if (invalidId) return `user ${invalidId} is not in Group DM ${channel.id}`;
+        if (!ringingIds.length) return "Group DM has no other users to call";
+
+        return this.connectCall(
+            channel,
+            "outgoing",
+            users,
+            [],
+            () => channel.ring(ringingIds),
+        );
     }
 
     public stopCall(): string {
@@ -110,9 +148,9 @@ export default class VoiceService extends AbstractService<"voice"> {
             }
             return `declined incoming voice call from user ${pendingUserIds.join(", ")}`;
         }
-        const userId = this.activeCall.targetUserId;
+        const label = this.activeCall.label;
         this.finishCall(this.activeCall, "stopped by tool");
-        return `ended voice call with user ${userId}`;
+        return `ended voice call with ${label}`;
     }
 
     public async destroy(): Promise<void> {
@@ -126,11 +164,21 @@ export default class VoiceService extends AbstractService<"voice"> {
         if (this.activeCall) this.finishCall(this.activeCall, "service shutdown");
     }
 
-    private async connectCall(user: User, channel: DMChannel, duration: number, ring: boolean): Promise<string> {
-        if (this.activeCall) return `already in a call with user ${this.activeCall.targetUserId}`;
+    private async connectCall(
+        channel: PrivateCallChannel,
+        direction: "incoming" | "outgoing",
+        usernames: Map<string, string>,
+        initialParticipants: Iterable<string>,
+        ring?: () => Promise<void>,
+    ): Promise<string> {
+        if (this.activeCall) return `already in a call with ${this.activeCall.label}`;
+
+        const label = channel.type === "DM"
+            ? channel.recipient.username
+            : channel.name || [...usernames.values()].join(", ") || channel.id;
 
         const connection = joinVoiceChannel({
-            adapterCreator: this.createDMAdapter(channel),
+            adapterCreator: this.createPrivateCallAdapter(channel),
             channelId: channel.id,
             daveEncryption: true,
             guildId: channel.id,
@@ -140,22 +188,30 @@ export default class VoiceService extends AbstractService<"voice"> {
         });
 
         const call: ActiveCall = {
+            capturing: new Set(),
             channelId: channel.id,
             connection,
             packetsReceived: 0,
-            participants: new Set(ring ? [] : [user.id]),
+            participants: new Set(initialParticipants),
             processingQueue: Promise.resolve(),
             startedAt: Date.now(),
-            targetUserId: user.id,
-            username: user.username,
+            label,
+            usernames,
             onSpeaking: () => undefined,
         };
         this.activeCall = call;
 
         call.onSpeaking = (speakingUserId) => {
-            if (speakingUserId !== user.id || this.activeCall !== call) return;
+            if (
+                speakingUserId === Core.services.bot.getClient().user?.id ||
+                this.activeCall !== call ||
+                call.capturing.has(speakingUserId)
+            ) return;
 
-            this.logger.log(`receiving audio from ${user.username} (${user.id})`);
+            call.capturing.add(speakingUserId);
+            this.trackParticipantJoined(call, speakingUserId);
+            const username = this.getParticipantUsername(call, speakingUserId);
+            this.logger.log(`receiving audio from ${username} (${speakingUserId})`);
             const decoder = new OpusScript(48_000, 2, OpusScript.Application.VOIP);
             const transcriptionChunks: Promise<string>[] = [];
             let pcmChunks: Buffer[] = [];
@@ -165,13 +221,17 @@ export default class VoiceService extends AbstractService<"voice"> {
             const chunkBytes = 48_000 * 2 * 2 * this.transcriptionChunkMs / 1000;
             const flushChunk = () => {
                 if (packetCount >= MIN_UTTERANCE_PACKETS && pcmBytes > 0) {
-                    transcriptionChunks.push(this.queueTranscription(call, Buffer.concat(pcmChunks, pcmBytes)));
+                    transcriptionChunks.push(this.queueTranscription(
+                        call,
+                        speakingUserId,
+                        Buffer.concat(pcmChunks, pcmBytes),
+                    ));
                 }
                 pcmChunks = [];
                 pcmBytes = 0;
                 packetCount = 0;
             };
-            const stream = connection.receiver.subscribe(user.id, {
+            const stream = connection.receiver.subscribe(speakingUserId, {
                 end: {
                     behavior: EndBehaviorType.AfterSilence,
                     duration: this.utteranceSilenceMs,
@@ -194,9 +254,12 @@ export default class VoiceService extends AbstractService<"voice"> {
             const finalize = () => {
                 if (finalized) return;
                 finalized = true;
+                call.capturing.delete(speakingUserId);
                 decoder.delete();
                 flushChunk();
-                if (transcriptionChunks.length) this.queueTranscriptProcessing(call, transcriptionChunks);
+                if (transcriptionChunks.length) {
+                    this.queueTranscriptProcessing(call, speakingUserId, username, transcriptionChunks);
+                }
             };
             stream.once("end", finalize);
             stream.once("close", finalize);
@@ -214,27 +277,25 @@ export default class VoiceService extends AbstractService<"voice"> {
 
         try {
             await entersState(connection, VoiceConnectionStatus.Ready, CONNECTION_TIMEOUT);
-            this.attachDMReceiveCompatibility(call);
-            if (ring) await channel.ring();
+            this.attachPrivateCallReceiveCompatibility(call);
+            if (ring) await ring();
         } catch (err) {
             this.finishCall(call, "startup failed");
             throw err;
         }
 
         call.startedAt = Date.now();
-        call.timeout = setTimeout(() => this.finishCall(call, "time limit reached"), duration);
-        call.timeout.unref();
         Core.services.bot.recordVoiceCallStarted({
             channelId: channel.id,
-            userId: user.id,
-            direction: ring ? "outgoing" : "incoming",
+            userId: [...call.participants][0] ?? [...usernames.keys()][0],
+            participantIds: [...call.participants],
+            channelType: channel.type,
+            direction,
             startedAt: new Date(call.startedAt),
         });
 
-        this.logger.log(`${ring ? "outgoing" : "incoming"} voice call started with ${user.username} (${user.id})`);
-        return ring
-            ? `calling ${user.username} for ${Math.round(duration / 1000)} seconds; their speech will be processed by the model`
-            : `answered voice call from ${user.username}`;
+        this.logger.log(`${direction} voice call started in ${label} (${channel.id})`);
+        return direction === "outgoing" ? `calling ${label}` : `answered voice call in ${label}`;
     }
 
     private handleCallState(call: CallState): void {
@@ -247,26 +308,35 @@ export default class VoiceService extends AbstractService<"voice"> {
         if (this.activeCall || this.pendingIncomingCalls.has(call.channelId) || this.ignoredIncomingCalls.has(call.channelId)) return;
 
         const channel = call.channel;
-        if (!channel || channel.type !== "DM") {
-            this.logger.log(`ignored incoming non-DM call in channel ${call.channelId}`);
+        if (!channel || (channel.type !== "DM" && channel.type !== "GROUP_DM")) {
+            this.logger.log(`ignored incoming call in unsupported channel ${call.channelId}`);
             return;
         }
 
-        const userId = channel.recipient.id;
+        const selfId = Core.services.bot.getClient().user?.id;
+        const usernames = this.getChannelUsernames(channel);
+        const connectedUserIds = [...channel.voiceUsers.keys()].filter(id => id !== selfId);
+        const userId = connectedUserIds[0] ?? [...usernames.keys()][0];
+        if (!userId) {
+            this.logger.warn(`incoming call in ${channel.id} had no identifiable caller`);
+            return;
+        }
+        const username = usernames.get(userId) ?? userId;
         const delay = this.incomingDelayMin + Math.random() * (this.incomingDelayMax - this.incomingDelayMin);
         const timeout = setTimeout(() => {
             this.pendingIncomingCalls.delete(call.channelId);
-            if (this.activeCall || !channel.voiceUsers.has(userId)) return;
-            void this.connectCall(channel.recipient, channel, this.incomingMaxDuration, false)
+            const participants = [...channel.voiceUsers.keys()].filter(id => id !== selfId);
+            if (this.activeCall || !participants.length) return;
+            void this.connectCall(channel, "incoming", usernames, participants)
                 .catch(err => this.logger.error(`failed to answer call from ${userId}: ${err?.message ?? err}`));
         }, delay);
         timeout.unref();
         this.pendingIncomingCalls.set(call.channelId, { timeout, userId });
-        this.logger.log(`incoming call from ${channel.recipient.username} (${userId}); answering in ${(delay / 1000).toFixed(1)}s`);
+        this.logger.log(`incoming call from ${username} (${userId}); answering in ${(delay / 1000).toFixed(1)}s`);
         void this.processVoiceEventWithRetry({
             channelId: call.channelId,
             userId,
-            username: channel.recipient.username,
+            username,
             messageId: `voice-event-${Id.get()}`,
             event: "incomingCall",
             occurredAt: new Date(),
@@ -277,7 +347,9 @@ export default class VoiceService extends AbstractService<"voice"> {
         this.cancelPendingIncomingCall(call.channelId, "call ended");
         this.ignoredIncomingCalls.delete(call.channelId);
         if (this.activeCall?.channelId === call.channelId) {
-            this.trackParticipantLeft(this.activeCall, this.activeCall.targetUserId);
+            for (const userId of [...this.activeCall.participants]) {
+                this.trackParticipantLeft(this.activeCall, userId);
+            }
             this.finishCall(this.activeCall, "remote call ended");
         }
     }
@@ -290,7 +362,7 @@ export default class VoiceService extends AbstractService<"voice"> {
         this.logger.log(`cancelled pending call answer for ${pending.userId}: ${reason}`);
     }
 
-    private createDMAdapter(channel: DMChannel): DiscordGatewayAdapterCreator {
+    private createPrivateCallAdapter(channel: PrivateCallChannel): DiscordGatewayAdapterCreator {
         return methods => {
             const adapter = channel.voiceAdapterCreator({
                 ...methods,
@@ -313,7 +385,23 @@ export default class VoiceService extends AbstractService<"voice"> {
         };
     }
 
-    private attachDMReceiveCompatibility(call: ActiveCall): void {
+    private getChannelUsernames(channel: PrivateCallChannel): Map<string, string> {
+        const selfId = Core.services.bot.getClient().user?.id;
+        if (channel.type === "DM") return new Map([[channel.recipient.id, channel.recipient.username]]);
+        return new Map(
+            [...channel.recipients.values()]
+                .filter(user => user.id !== selfId)
+                .map(user => [user.id, user.username]),
+        );
+    }
+
+    private getParticipantUsername(call: ActiveCall, userId: string): string {
+        const cached = Core.services.bot.getClient().users.cache.get(userId)?.username;
+        if (cached) call.usernames.set(userId, cached);
+        return cached ?? call.usernames.get(userId) ?? userId;
+    }
+
+    private attachPrivateCallReceiveCompatibility(call: ActiveCall): void {
         const connectionState = call.connection.state;
         if (connectionState.status !== VoiceConnectionStatus.Ready) return;
 
@@ -343,7 +431,7 @@ export default class VoiceService extends AbstractService<"voice"> {
                 audioSSRC,
                 ...(Number.isInteger(videoSSRC) && videoSSRC > 0 ? { videoSSRC } : {}),
             });
-            this.logger.log(`mapped DM voice participant ${userId} to SSRC ${audioSSRC}`);
+            this.logger.log(`mapped private-call participant ${userId} to SSRC ${audioSSRC}`);
         };
 
         call.onVoicePacket = onVoicePacket;
@@ -353,6 +441,12 @@ export default class VoiceService extends AbstractService<"voice"> {
 
     private trackParticipantJoined(call: ActiveCall, userId: unknown): void {
         if (typeof userId !== "string" || userId === Core.services.bot.getClient().user?.id || call.participants.has(userId)) return;
+        if (call.emptyCallTimeout) {
+            clearTimeout(call.emptyCallTimeout);
+            call.emptyCallTimeout = undefined;
+        }
+        const user = Core.services.bot.getClient().users.cache.get(userId);
+        if (user) call.usernames.set(userId, user.username);
         call.participants.add(userId);
         this.queueVoiceEvent(call, "participantJoined", userId);
     }
@@ -360,14 +454,22 @@ export default class VoiceService extends AbstractService<"voice"> {
     private trackParticipantLeft(call: ActiveCall, userId: unknown): void {
         if (typeof userId !== "string" || !call.participants.delete(userId)) return;
         this.queueVoiceEvent(call, "participantLeft", userId);
+        if (call.participants.size === 0 && this.activeCall === call) {
+            call.emptyCallTimeout = setTimeout(() => {
+                call.emptyCallTimeout = undefined;
+                if (this.activeCall === call && call.participants.size === 0) {
+                    this.finishCall(call, "no other participants remained");
+                }
+            }, this.emptyCallGraceMs);
+            call.emptyCallTimeout.unref();
+        }
     }
 
     private queueVoiceEvent(call: ActiveCall, event: "participantJoined" | "participantLeft", userId: string): void {
-        const user = Core.services.bot.getClient().users.cache.get(userId);
         call.processingQueue = call.processingQueue.then(() => this.processVoiceEventWithRetry({
             channelId: call.channelId,
             userId,
-            username: user?.username ?? (userId === call.targetUserId ? call.username : userId),
+            username: this.getParticipantUsername(call, userId),
             messageId: `voice-event-${Id.get()}`,
             event,
             occurredAt: new Date(),
@@ -389,7 +491,7 @@ export default class VoiceService extends AbstractService<"voice"> {
         this.logger.warn(`voice event ${input.event} was not processed because channel ${input.channelId} remained busy`);
     }
 
-    private queueTranscription(call: ActiveCall, stereoPcm: Buffer): Promise<string> {
+    private queueTranscription(call: ActiveCall, userId: string, stereoPcm: Buffer): Promise<string> {
         const wav = this.createMonoWav(stereoPcm);
         if (!this.hasSpeech(wav.subarray(44))) {
             this.logger.log("skipped silent voice utterance");
@@ -397,7 +499,7 @@ export default class VoiceService extends AbstractService<"voice"> {
         }
 
         return Core.services.agent.transcribe(wav).then(transcript => {
-            if (transcript) this.logger.log(`transcription chunk from ${call.targetUserId}: ${transcript}`);
+            if (transcript) this.logger.log(`transcription chunk from ${userId}: ${transcript}`);
             return transcript;
         }).catch(err => {
             this.logger.error(`voice transcription failed: ${err?.message ?? err}`);
@@ -405,15 +507,15 @@ export default class VoiceService extends AbstractService<"voice"> {
         });
     }
 
-    private queueTranscriptProcessing(call: ActiveCall, chunks: Promise<string>[]): void {
+    private queueTranscriptProcessing(call: ActiveCall, userId: string, username: string, chunks: Promise<string>[]): void {
         call.processingQueue = call.processingQueue.then(async () => {
             const transcript = (await Promise.all(chunks)).filter(Boolean).join(" ").trim();
             if (!transcript) return;
-            this.logger.log(`transcript from ${call.targetUserId}: ${transcript}`);
+            this.logger.log(`transcript from ${userId}: ${transcript}`);
             const input = {
                 channelId: call.channelId,
-                userId: call.targetUserId,
-                username: call.username,
+                userId,
+                username,
                 messageId: `voice-${Id.get()}`,
                 transcript,
             };
@@ -476,6 +578,7 @@ export default class VoiceService extends AbstractService<"voice"> {
         this.activeCall = undefined;
 
         if (call.timeout) clearTimeout(call.timeout);
+        if (call.emptyCallTimeout) clearTimeout(call.emptyCallTimeout);
         if (call.voiceWebSocket && call.onVoicePacket) {
             call.voiceWebSocket.off("packet", call.onVoicePacket);
         }
