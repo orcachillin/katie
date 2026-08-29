@@ -38,6 +38,11 @@ export default class ChatClient extends BaseAIClient {
 
         const response = await this.post(body, options?.signal, "LLM");
         const data = (await response.json()) as any;
+        const estimated = estimateContextTokens(fullMessages);
+        const actualPrompt = data.usage?.prompt_tokens;
+        if (actualPrompt) {
+            this.logger.log(`token check: estimated ~${estimated}, actual ${actualPrompt} (drift ${(actualPrompt / estimated).toFixed(2)}x)`);
+        }
         const choice = data.choices?.[0];
         const content = choice?.message?.content ?? null;
         const toolCalls = choice?.message?.tool_calls?.map((toolCall: any) => ({

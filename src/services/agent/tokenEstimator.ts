@@ -1,7 +1,7 @@
 import type { ChatMessage } from "./types.js";
 
-const CHARS_PER_TOKEN = 4;
-const CODE_CHARS_PER_TOKEN = 3;
+const CHARS_PER_TOKEN = 2;
+const CODE_CHARS_PER_TOKEN = 1.5;
 const BASE64_CHARS_PER_TOKEN = 2;
 const BASE64_MIN_LENGTH = 200;
 const BASE64_PATTERN = new RegExp(`[A-Za-z0-9+/=]{${BASE64_MIN_LENGTH},}`, "g");
