@@ -11,6 +11,7 @@ export const bash = {
     type: "function",
     function: {
         name: "bash",
+        requiredCapability: "tools.bash",
         description: "run a shell command. if host is provided, runs via SSH (key-based auth must be configured).",
         parameters: {
             type: "object",
@@ -26,6 +27,13 @@ export const bash = {
         execute: async (args) => {
             let command = args.command as string;
             const timeout = Math.min((args.timeout as number) ?? DEFAULT_TIMEOUT, 120_000);
+
+            // hardcoded: katie uses `bash true` as a "wait for messages" hack, which
+            // floods the session with no-op tool calls. block no-op commands outright.
+            const noopPattern = /^\s*(true|:|\/bin\/true)\s*(;|&&)?\s*$/;
+            if (noopPattern.test(command)) {
+                return "blocked: no-op command (`true`) is not allowed. if you are waiting for new messages, just stop and wait - you will be interrupted when one arrives.";
+            }
             const cwd = args.cwd as string | undefined;
             const host = args.host as string | undefined;
             const port = (args.port as number) ?? 22;
