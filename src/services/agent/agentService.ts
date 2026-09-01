@@ -3,7 +3,6 @@ import { resolve, sep } from "node:path";
 import AbstractService from "../../base/abstractService.js";
 import Core from "../../core.js";
 import { selectRecentImages } from "./imageSelection.js";
-import { trimOldToolResults } from "./tokenEstimator.js";
 import ChatClient from "./clients/chatClient.js";
 import TranscriptionClient from "./clients/transcriptionClient.js";
 import type { ChatMessage, ChatOptions, ChatResponse, PreparedMessages, StreamChunk } from "./types.js";
@@ -101,8 +100,6 @@ export default class AgentService extends AbstractService<"agent"> {
 
             return { ...preparedMessage, content };
         }));
-
-        trimOldToolResults(prepared as ChatMessage[]);
 
         return { messages: prepared, hasImages };
     }

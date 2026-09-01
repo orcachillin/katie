@@ -6,7 +6,6 @@ const BASE64_CHARS_PER_TOKEN = 2;
 const BASE64_MIN_LENGTH = 200;
 const BASE64_PATTERN = new RegExp(`[A-Za-z0-9+/=]{${BASE64_MIN_LENGTH},}`, "g");
 const IMAGE_TOKENS = 16;
-const TOOL_RESULT_MAX_CHARS = 200;
 export const TRUNCATED_MARKER = "[truncated]";
 
 export function estimateTokens(text: string): number {
@@ -32,19 +31,4 @@ export function estimateMessageTokens(message: ChatMessage): number {
 
 export function estimateContextTokens(messages: ChatMessage[]): number {
     return messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
-}
-
-export function trimOldToolResults(messages: ChatMessage[]): void {
-    let end = messages.length - 1;
-    while (end >= 0 && messages[end].role !== "tool") end--;
-    if (end === -1) return;
-    let start = end;
-    while (start > 0 && messages[start - 1].role === "tool") start--;
-    for (let i = 0; i < start; i++) {
-        const message = messages[i];
-        if (message.role !== "tool" || typeof message.content !== "string") continue;
-        if (message.content.endsWith(TRUNCATED_MARKER)) continue;
-        if (message.content.length <= TOOL_RESULT_MAX_CHARS) continue;
-        message.content = `${message.content.slice(0, TOOL_RESULT_MAX_CHARS)} ${TRUNCATED_MARKER}`;
-    }
 }
